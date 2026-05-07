@@ -61,14 +61,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // State drives status bar text/icon/colour and the click-through advice.
   // - notRegistered: mcp.json missing entry → broken icon, advise registration.
-  // - registeredAwaitingClient: registered but no bridge has authed yet →
+  // - connecting: registered, within grace period for the bridge to auth →
+  //   neutral spinner, no background. Avoids drawing attention during the
+  //   normal 5-10s connect window.
+  // - registeredAwaitingClient: still no bridge after the grace period →
   //   warn icon, advise restarting Claude Code.
   // - ready: at least one authed client connected → terminal icon.
-  let regState: 'notRegistered' | 'registeredAwaitingClient' | 'ready' =
-    isRegisteredWithClaude(context) ? 'registeredAwaitingClient' : 'notRegistered';
+  const CONNECT_GRACE_MS = 15_000;
+  let regState: 'notRegistered' | 'connecting' | 'registeredAwaitingClient' | 'ready' =
+    isRegisteredWithClaude(context) ? 'connecting' : 'notRegistered';
+  let graceTimer: NodeJS.Timeout | null = null;
   const renderStatus = () => {
     if (!statusBar) return;
-    // Icon-only status bar to save space. Three states distinguished by icon
+    // Icon-only status bar to save space. States distinguished by icon
     // and background colour; details live in the tooltip and click-through.
     if (regState === 'ready') {
       statusBar.text = `$(terminal)`;
@@ -76,6 +81,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       statusBar.tooltip =
         `Terminal Reader v${version} — connected\n` +
         `Pipe: ${pipePath}\nWorkspace: ${wsRoot ?? '(none)'}`;
+    } else if (regState === 'connecting') {
+      statusBar.text = `$(sync~spin)`;
+      statusBar.backgroundColor = undefined;
+      statusBar.tooltip =
+        `Terminal Reader v${version} — waiting for Claude Code to connect…\n` +
+        `Pipe: ${pipePath}`;
     } else if (regState === 'registeredAwaitingClient') {
       statusBar.text = `$(warning)`;
       statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
@@ -92,14 +103,55 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         `Pipe: ${pipePath}`;
     }
   };
+  // Set when registration just wrote a new entry — the reload prompt is
+  // deferred until the grace timer gives up, so a fast-connecting bridge
+  // never sees the popup at all.
+  let pendingReloadPrompt = false;
+  const startGraceTimer = () => {
+    if (graceTimer) clearTimeout(graceTimer);
+    graceTimer = setTimeout(() => {
+      graceTimer = null;
+      if (regState === 'connecting') {
+        regState = 'registeredAwaitingClient';
+        renderStatus();
+        if (pendingReloadPrompt) {
+          pendingReloadPrompt = false;
+          void (async () => {
+            const choice = await vscode.window.showInformationMessage(
+              "Terminal Reader: registered MCP server with Claude Code.\n" +
+              "Reload the VSCode window so the Claude Code extension picks up the new MCP server.",
+              'Reload window', 'Later'
+            );
+            if (choice === 'Reload window') {
+              await vscode.commands.executeCommand('workbench.action.reloadWindow');
+            }
+          })();
+        }
+      }
+    }, CONNECT_GRACE_MS);
+  };
+  if (regState === 'connecting') startGraceTimer();
   renderStatus();
 
   context.subscriptions.push(
     server.onClientAuthed(() => {
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+        graceTimer = null;
+      }
+      pendingReloadPrompt = false;
       regState = 'ready';
       renderStatus();
     })
   );
+  context.subscriptions.push({
+    dispose: () => {
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+        graceTimer = null;
+      }
+    }
+  });
 
   // Run registration off the activation path: file I/O on ~/.claude.json
   // shouldn't stall the extension host. Sticky notification (action item
@@ -107,19 +159,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   setImmediate(async () => {
     try {
       const changed = ensureRegisteredWithClaude(context);
-      if (regState !== 'ready') {
-        regState = 'registeredAwaitingClient';
+      if (changed) pendingReloadPrompt = true;
+      if (regState !== 'ready' && regState !== 'connecting') {
+        regState = 'connecting';
+        startGraceTimer();
         renderStatus();
-      }
-      if (changed) {
-        const choice = await vscode.window.showInformationMessage(
-          "Terminal Reader: registered MCP server with Claude Code.\n" +
-          "Reload the VSCode window so the Claude Code extension picks up the new MCP server.",
-          'Reload window', 'Later'
-        );
-        if (choice === 'Reload window') {
-          await vscode.commands.executeCommand('workbench.action.reloadWindow');
-        }
       }
     } catch (e: any) {
       regState = 'notRegistered';
@@ -142,6 +186,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           `Terminal Reader: connected.\n${detail}`,
           'Got it'
         );
+      } else if (regState === 'connecting') {
+        await vscode.window.showInformationMessage(
+          `Terminal Reader: waiting for Claude Code to connect…\n${detail}`,
+          'Got it'
+        );
       } else if (regState === 'registeredAwaitingClient') {
         const pick = await vscode.window.showWarningMessage(
           "Terminal Reader is registered with Claude Code but no client has connected yet.\n" +
@@ -160,7 +209,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (pick === 'Register') {
           await registerWithClaude(context);
           if (isRegisteredWithClaude(context)) {
-            regState = 'registeredAwaitingClient';
+            regState = 'connecting';
+            startGraceTimer();
             renderStatus();
           }
         }
