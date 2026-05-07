@@ -1,20 +1,43 @@
 {
   "name": "vscode-terminal-reader",
   "displayName": "Terminal Reader for Claude",
-  "description": "Lets Claude Code read this VSCode window's terminals, problems, debug, tasks, and ports via a local MCP server.",
-  "version": "0.0.12",
+  "description": "Lets Claude Code read this VSCode window's terminals and Problems panel via a local MCP server. No more copy-pasting build output.",
+  "version": "0.0.15",
   "publisher": "dwrigh",
+  "license": "MIT",
   "icon": "resources/icon.png",
+  "homepage": "https://github.com/davwright/vscode-terminal-reader#readme",
   "repository": {
     "type": "git",
     "url": "https://github.com/davwright/vscode-terminal-reader.git"
   },
+  "bugs": {
+    "url": "https://github.com/davwright/vscode-terminal-reader/issues"
+  },
+  "qna": "https://github.com/davwright/vscode-terminal-reader/issues",
   "engines": {
     "vscode": "^1.93.0"
   },
   "categories": [
+    "AI",
+    "Chat",
     "Other"
   ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "mcp",
+    "ai",
+    "terminal",
+    "problems",
+    "diagnostics",
+    "agent",
+    "anthropic"
+  ],
+  "galleryBanner": {
+    "color": "#1f1f1f",
+    "theme": "dark"
+  },
   "activationEvents": [
     "onStartupFinished"
   ],

@@ -2,8 +2,14 @@ src/**
 node_modules/**
 .vscode/**
 .claude/**
+.github/**
 scripts/**
 tsconfig.json
 *.map
 .gitignore
+.gitattributes
 package-lock.json
+**/CLAUDE.md
+**/AGENTS.md
+resources/icon.svg
+*.vsix

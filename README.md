@@ -21,12 +21,24 @@ The extension does the heavy lifting (server-side regex, line-numbered ranges, r
 
 ## Install
 
-1. Install the `.vsix` (or grab it from the [GitHub Releases](https://github.com/davwright/vscode-terminal-reader/releases)).
-2. Reload the VSCode window. The extension auto-registers itself with Claude Code.
-3. Reload **once more** so Claude Code picks up the new MCP server.
-4. The status bar icon turns from `$(warning)` to `$(terminal)` once a Claude session connects. Done.
+**Prerequisite:** the [Claude Code](https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code) extension. This extension is useless without it.
 
-If anything's wrong, click the status bar icon — it tells you what's missing and offers a one-click fix.
+**The easy way** — install from the VSCode Marketplace:
+
+1. Open the Extensions view (`Ctrl+Shift+X`), search for **Terminal Reader for Claude**, click **Install**.
+2. Done. The extension auto-registers itself with Claude Code, both extensions notice each other, and the status bar lights up green once a Claude session connects.
+
+**The manual way** — install from a `.vsix`:
+
+1. Download the latest `.vsix` from [GitHub Releases](https://github.com/davwright/vscode-terminal-reader/releases). Nothing to compile.
+2. In VSCode: `Ctrl+Shift+P` → **Extensions: Install from VSIX…** → pick the file.
+3. Same as above — auto-registration handles the rest.
+
+If the status bar icon stays yellow or red, click it — the tooltip and one-click fixes will tell you what's missing.
+
+## How Claude knows what it can do
+
+You don't have to teach Claude anything. The extension exposes itself as an MCP server, and on first connection Claude calls `tools/list` and reads the tool descriptions and input schemas the extension ships with. From that point on Claude knows the eight tools below, what each one returns, and how to combine them — for the lifetime of every future Claude session in that VSCode window.
 
 ## What Claude can do
 
@@ -49,7 +61,7 @@ Eight tools, all under the `mcp__vscode-reader__*` namespace:
 
 **Stable line numbers.** Every line gets a 1-based number that never changes, never repeats, never resets. Claude can grep for "error", spot it on line 88, and read lines 80–95 for context in a follow-up call.
 
-**Three output formats.** `text` (compact, default), `json` (programmatic), or `raw` (the unmodified stream including ANSI colours and shell-integration markers — for when Claude needs to see exit codes, command boundaries, or coloured output).
+**Three output formats.** `text` (compact, default), `json` (programmatic), or `raw` (the unmodified stream including ANSI colours and shell-integration markers — for when Claude needs to see exit codes, command boundaries, or coloured output). Grep, range, tail, and context filters all work on every format — including `raw`, where the bytes inside kept lines are preserved verbatim.
 
 **Polling without re-reading.** `terminal_state` returns just metadata. Claude can wait for a long command to finish without re-fetching megabytes of output every tick.
 
@@ -66,13 +78,7 @@ Eight tools, all under the `mcp__vscode-reader__*` namespace:
 
 ## Status bar
 
-A single icon, three states:
-
-- `$(terminal)` — Claude is connected. Everything's working.
-- `$(warning)` — Registered, but Claude hasn't connected yet. Click for a one-click reload.
-- `$(error)` — Not registered. Click to fix.
-
-Click the icon any time for diagnostic detail and recovery actions.
+The status bar icon shows three states: green (Claude connected), yellow (registered but waiting for Claude to connect), red (not registered). Click it any time for diagnostic detail and one-click recovery actions.
 
 ## Limitations
 
