@@ -1,28 +1,68 @@
 import * as vscode from 'vscode';
 import { RingBuffer, NumberedLine, stripAnsi } from './RingBuffer';
 
+export type ReadFormat = 'json' | 'text' | 'raw';
+
 export interface ReadOpts {
   tail?: number;
   grep?: string;
+  grepFlags?: string;
   range?: [number, number];
   context?: number;
   stripAnsi?: boolean;
+  format?: ReadFormat;
 }
 
-export interface ReadResult {
+export interface JsonReadResult {
   name: string;
+  format: 'json';
   totalLines: number;
   lines: NumberedLine[];
+}
+
+export interface TextReadResult {
+  name: string;
+  format: 'text';
+  totalLines: number;
+  text: string;
+}
+
+export interface RawReadResult {
+  name: string;
+  format: 'raw';
+  totalBytes: number;
+  text: string;
+}
+
+export type ReadResult = JsonReadResult | TextReadResult | RawReadResult;
+
+export interface TerminalState {
+  name: string;
+  status: 'busy' | 'idle' | 'unknown';
+  shellIntegration: boolean;
+  lastCommand?: string;
+  lastExitCode?: number;
+  lastCommandStartedAt?: number;
+  lastCommandFinishedAt?: number;
+  bufferLines: number;
+  totalLines: number;
+  cwd?: string;
 }
 
 interface TerminalEntry {
   terminal: vscode.Terminal;
   buffer: RingBuffer;
+  rawBuffer: string;
+  rawBytes: number;
   shellIntegrationActive: boolean;
+  busy: boolean;
   lastCommand?: string;
   lastExitCode?: number;
   lastCommandStartedAt?: number;
+  lastCommandFinishedAt?: number;
 }
+
+const RAW_BUFFER_MAX_BYTES = 1024 * 1024; // 1 MiB rolling raw stream per terminal
 
 export class TerminalCapture implements vscode.Disposable {
   private readonly entries = new Map<vscode.Terminal, TerminalEntry>();
@@ -43,12 +83,17 @@ export class TerminalCapture implements vscode.Disposable {
         if (!entry) return;
         entry.lastCommand = e.execution.commandLine.value;
         entry.lastCommandStartedAt = Date.now();
-        entry.buffer.append(`\n▶ ${entry.lastCommand}\n`);
+        entry.lastCommandFinishedAt = undefined;
+        entry.busy = true;
+        const startMarker = `\n▶ ${entry.lastCommand}\n`;
+        entry.buffer.append(startMarker);
+        this.appendRaw(entry, startMarker);
         const stream = e.execution.read();
         (async () => {
           try {
             for await (const chunk of stream) {
               entry.buffer.append(chunk);
+              this.appendRaw(entry, chunk);
             }
           } catch {
             // stream ended unexpectedly
@@ -59,8 +104,12 @@ export class TerminalCapture implements vscode.Disposable {
         const entry = this.entries.get(e.terminal);
         if (!entry) return;
         entry.lastExitCode = e.exitCode;
+        entry.lastCommandFinishedAt = Date.now();
+        entry.busy = false;
         entry.buffer.flushPartial();
-        entry.buffer.append(`■ exit ${e.exitCode ?? '?'}\n`);
+        const endMarker = `■ exit ${e.exitCode ?? '?'}\n`;
+        entry.buffer.append(endMarker);
+        this.appendRaw(entry, endMarker);
       })
     );
   }
@@ -70,25 +119,51 @@ export class TerminalCapture implements vscode.Disposable {
     this.entries.set(terminal, {
       terminal,
       buffer: new RingBuffer(this.maxLines()),
-      shellIntegrationActive: !!terminal.shellIntegration
+      rawBuffer: '',
+      rawBytes: 0,
+      shellIntegrationActive: !!terminal.shellIntegration,
+      busy: false
     });
+  }
+
+  private appendRaw(entry: TerminalEntry, chunk: string): void {
+    entry.rawBuffer += chunk;
+    entry.rawBytes += chunk.length;
+    if (entry.rawBuffer.length > RAW_BUFFER_MAX_BYTES) {
+      const overflow = entry.rawBuffer.length - RAW_BUFFER_MAX_BYTES;
+      entry.rawBuffer = entry.rawBuffer.slice(overflow);
+    }
+  }
+
+  private resolve(target: { name?: string; index?: number }): TerminalEntry | undefined {
+    const list = Array.from(this.entries.values());
+    if (target.name) return list.find((e) => e.terminal.name === target.name);
+    if (typeof target.index === 'number') return list[target.index];
+    // Default: most recently active. The active terminal is the user's focus
+    // or the most recently created one, in that order.
+    const active = vscode.window.activeTerminal;
+    if (active) {
+      const found = list.find((e) => e.terminal === active);
+      if (found) return found;
+    }
+    return list[list.length - 1];
   }
 
   list(): Array<{
     name: string;
-    pid: number | undefined;
     cwd: string | undefined;
     shellIntegration: boolean;
     bufferLines: number;
+    busy: boolean;
     lastCommand?: string;
     lastExitCode?: number;
   }> {
     return Array.from(this.entries.values()).map((e) => ({
       name: e.terminal.name,
-      pid: undefined,
       cwd: e.terminal.shellIntegration?.cwd?.fsPath,
       shellIntegration: e.shellIntegrationActive,
       bufferLines: e.buffer.size(),
+      busy: e.busy,
       lastCommand: e.lastCommand,
       lastExitCode: e.lastExitCode
     }));
@@ -98,15 +173,7 @@ export class TerminalCapture implements vscode.Disposable {
     target: { name?: string; index?: number },
     opts: ReadOpts = {}
   ): ReadResult | { error: string } {
-    const list = Array.from(this.entries.values());
-    let entry: TerminalEntry | undefined;
-    if (target.name) {
-      entry = list.find((e) => e.terminal.name === target.name);
-    } else if (typeof target.index === 'number') {
-      entry = list[target.index];
-    } else {
-      entry = list[list.length - 1];
-    }
+    const entry = this.resolve(target);
     if (!entry) return { error: 'terminal not found' };
     return this.formatRead(entry, opts);
   }
@@ -115,26 +182,95 @@ export class TerminalCapture implements vscode.Disposable {
     return Array.from(this.entries.values()).map((entry) => this.formatRead(entry, opts));
   }
 
-  private formatRead(entry: TerminalEntry, opts: ReadOpts): ReadResult {
-    const matches = entry.buffer.read({
-      tail: opts.tail,
-      grep: opts.grep,
-      range: opts.range,
-      context: opts.context
-    });
-    const stripped =
-      opts.stripAnsi !== false
-        ? matches.map((m) => ({ lineNumber: m.lineNumber, text: stripAnsi(m.text) }))
-        : matches;
+  state(target: { name?: string; index?: number } = {}): TerminalState | { error: string } {
+    const entry = this.resolve(target);
+    if (!entry) return { error: 'terminal not found' };
     return {
       name: entry.terminal.name,
+      status: entry.shellIntegrationActive ? (entry.busy ? 'busy' : 'idle') : 'unknown',
+      shellIntegration: entry.shellIntegrationActive,
+      lastCommand: entry.lastCommand,
+      lastExitCode: entry.lastExitCode,
+      lastCommandStartedAt: entry.lastCommandStartedAt,
+      lastCommandFinishedAt: entry.lastCommandFinishedAt,
+      bufferLines: entry.buffer.size(),
       totalLines: entry.buffer.nextLineNumber() - 1,
-      lines: stripped
+      cwd: entry.terminal.shellIntegration?.cwd?.fsPath
     };
   }
 
-  clear(): void {
-    for (const e of this.entries.values()) e.buffer.clear();
+  /**
+   * Send Ctrl-C (ETX, 0x03) to the terminal. Not gated by any allowlist —
+   * Ctrl-C is a safety primitive, the user always wants the LLM to be able
+   * to abort a runaway command.
+   */
+  interrupt(target: { name?: string; index?: number } = {}): { sent: boolean; name?: string; reason?: string } {
+    const entry = this.resolve(target);
+    if (!entry) return { sent: false, reason: 'terminal not found' };
+    try {
+      entry.terminal.sendText('\x03', false);
+      return { sent: true, name: entry.terminal.name };
+    } catch (e: any) {
+      return { sent: false, reason: e?.message ?? String(e) };
+    }
+  }
+
+  private formatRead(entry: TerminalEntry, opts: ReadOpts): ReadResult {
+    const format = opts.format ?? 'text';
+    const totalLines = entry.buffer.nextLineNumber() - 1;
+
+    if (format === 'raw') {
+      // Raw stream — never strip ANSI/OSC, so OSC 633 markers and colours are
+      // preserved for callers that want to parse them themselves. Range/grep
+      // don't apply to raw; tail trims by trailing line count if requested.
+      let text = entry.rawBuffer;
+      if (opts.tail && opts.tail > 0) {
+        const lines = text.split('\n');
+        if (lines.length > opts.tail) text = lines.slice(-opts.tail).join('\n');
+      }
+      return { name: entry.terminal.name, format: 'raw', totalBytes: entry.rawBytes, text };
+    }
+
+    const matches = entry.buffer.read({
+      tail: opts.tail,
+      grep: opts.grep,
+      grepFlags: opts.grepFlags,
+      range: opts.range,
+      context: opts.context
+    });
+    const lines =
+      opts.stripAnsi !== false
+        ? matches.map((m) => ({ lineNumber: m.lineNumber, text: stripAnsi(m.text) }))
+        : matches;
+
+    if (format === 'json') {
+      return { name: entry.terminal.name, format: 'json', totalLines, lines };
+    }
+
+    // 'text' format: pipe-separated, padded line numbers. Padding width tracks
+    // the largest number in this batch so columns align without padding to
+    // the buffer's full size every time.
+    const maxNum = lines.length > 0 ? lines[lines.length - 1].lineNumber : 1;
+    const width = Math.max(4, String(maxNum).length);
+    const text = lines.map((l) => `${String(l.lineNumber).padStart(width)} | ${l.text}`).join('\n');
+    return { name: entry.terminal.name, format: 'text', totalLines, text };
+  }
+
+  clear(target?: { name?: string; index?: number; all?: boolean }): { cleared: string[] } {
+    if (!target || target.all) {
+      const names: string[] = [];
+      for (const e of this.entries.values()) {
+        e.buffer.clear();
+        e.rawBuffer = '';
+        names.push(e.terminal.name);
+      }
+      return { cleared: names };
+    }
+    const entry = this.resolve({ name: target.name, index: target.index });
+    if (!entry) return { cleared: [] };
+    entry.buffer.clear();
+    entry.rawBuffer = '';
+    return { cleared: [entry.terminal.name] };
   }
 
   dispose(): void {

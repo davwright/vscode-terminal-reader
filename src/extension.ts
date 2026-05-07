@@ -68,21 +68,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     isRegisteredWithClaude(context) ? 'registeredAwaitingClient' : 'notRegistered';
   const renderStatus = () => {
     if (!statusBar) return;
+    // Icon-only status bar to save space. Three states distinguished by icon
+    // and background colour; details live in the tooltip and click-through.
     if (regState === 'ready') {
-      statusBar.text = `$(terminal) TR v${version}`;
+      statusBar.text = `$(terminal)`;
       statusBar.backgroundColor = undefined;
       statusBar.tooltip =
         `Terminal Reader v${version} — connected\n` +
         `Pipe: ${pipePath}\nWorkspace: ${wsRoot ?? '(none)'}`;
     } else if (regState === 'registeredAwaitingClient') {
-      statusBar.text = `$(warning) TR v${version}`;
+      statusBar.text = `$(warning)`;
       statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
       statusBar.tooltip =
         `Terminal Reader v${version} — registered but Claude Code hasn't connected.\n` +
         `Reload the VSCode window (Ctrl+Shift+P → "Developer: Reload Window") so the Claude Code extension picks up the MCP server.\n` +
         `Pipe: ${pipePath}`;
     } else {
-      statusBar.text = `$(error) TR v${version}`;
+      statusBar.text = `$(error)`;
       statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
       statusBar.tooltip =
         `Terminal Reader v${version} — not registered with Claude Code.\n` +
@@ -99,8 +101,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
-  // Run registration off the activation path: file I/O on ~/.claude/mcp.json
-  // shouldn't stall the extension host. Use a sticky notification (action item
+  // Run registration off the activation path: file I/O on ~/.claude.json
+  // shouldn't stall the extension host. Sticky notification (action item
   // keeps it open) and a \n so the message doesn't get cropped.
   setImmediate(async () => {
     try {
