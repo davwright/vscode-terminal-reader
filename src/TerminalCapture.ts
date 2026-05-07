@@ -221,14 +221,37 @@ export class TerminalCapture implements vscode.Disposable {
 
     if (format === 'raw') {
       // Raw stream — never strip ANSI/OSC, so OSC 633 markers and colours are
-      // preserved for callers that want to parse them themselves. Range/grep
-      // don't apply to raw; tail trims by trailing line count if requested.
-      let text = entry.rawBuffer;
-      if (opts.tail && opts.tail > 0) {
-        const lines = text.split('\n');
-        if (lines.length > opts.tail) text = lines.slice(-opts.tail).join('\n');
+      // preserved for callers that want to parse them themselves. grep, tail,
+      // and context all work on lines; the bytes within each kept line are
+      // untouched. range is intentionally not supported on raw because the
+      // raw buffer is byte-bounded (1 MiB) rather than line-numbered.
+      let lines = entry.rawBuffer.split('\n');
+      if (opts.grep) {
+        const re = new RegExp(opts.grep, opts.grepFlags ?? 'i');
+        const ctx = Math.max(0, opts.context ?? 0);
+        if (ctx === 0) {
+          lines = lines.filter((l) => re.test(l));
+        } else {
+          const keep = new Set<number>();
+          for (let i = 0; i < lines.length; i++) {
+            if (re.test(lines[i])) {
+              for (let j = Math.max(0, i - ctx); j <= Math.min(lines.length - 1, i + ctx); j++) {
+                keep.add(j);
+              }
+            }
+          }
+          lines = lines.filter((_, i) => keep.has(i));
+        }
       }
-      return { name: entry.terminal.name, format: 'raw', totalBytes: entry.rawBytes, text };
+      if (opts.tail && opts.tail > 0 && lines.length > opts.tail) {
+        lines = lines.slice(-opts.tail);
+      }
+      return {
+        name: entry.terminal.name,
+        format: 'raw',
+        totalBytes: entry.rawBytes,
+        text: lines.join('\n')
+      };
     }
 
     const matches = entry.buffer.read({

@@ -8,7 +8,7 @@ export interface ToolDef {
 }
 
 const FORMAT_DOC =
-  "format: 'text' (default, compact: '   142 | <line>'), 'json' ({lineNumber,text}[] for programmatic), or 'raw' (untouched stream incl. ANSI/OSC 633 — use to detect command boundaries, exit codes, colours).";
+  "format: 'text' (default, compact: '   142 | <line>'), 'json' ({lineNumber,text}[] for programmatic), or 'raw' (untouched stream incl. ANSI/OSC 633 — use to detect command boundaries, exit codes, colours). grep/tail/context all work on raw too; bytes within kept lines are unmodified.";
 
 const SELECTION_DOC =
   "Selection options combine: range:[start,end] slices by line number; grep (JS regex, case-insensitive) filters; context:N adds N before/after around each grep match; tail keeps the last N after grep/range.";
