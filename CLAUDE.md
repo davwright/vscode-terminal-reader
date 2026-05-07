@@ -14,6 +14,8 @@ VSCode extension that exposes this VSCode window's terminals + problems to Claud
 - Endpoint files live in `%APPDATA%\vscode-terminal-reader\windows\<extensionHostPid>.json`. They include an auth token; the bridge sends `auth` before any tool call.
 - Terminal output capture only works when shell integration is active. Document this; do not pretend otherwise.
 - ANSI stripping is applied on read, not on write — keeps the raw stream available if a future tool wants it.
+- MCP registration writes user scope into `~/.claude.json` (top-level `mcpServers`), honouring `CLAUDE_CONFIG_DIR`. Do NOT write to `~/.claude/mcp.json` — that path is not part of Claude Code's spec. See the user-level `claude-code-mcp` skill for the full reference (scopes, JSON shape, restart semantics).
+- "Restart Claude Code" for users of the VSCode extension means **Reload Window** (Developer: Reload Window). For CLI users it's `/exit` + re-run `claude`. Match user-facing strings to the flavor in use.
 
 ## Things to add (deliberately deferred)
 

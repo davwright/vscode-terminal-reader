@@ -16,26 +16,30 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'terminal_read',
     description:
-      "Read recent output from a terminal. Use 'name' or 'index'. Optional 'tail' (last N lines) and 'grep' (regex).",
+      "Read terminal output. Returns {name, totalLines, lines:[{lineNumber,text},...]} with stable 1-based line numbers (monotonic across reads). Identify the terminal with 'name' or 'index'; default is the most recently active. Selection (combined): 'range:[start,end]' (inclusive) slices by line number; 'grep' (JS regex, case-insensitive default) filters; 'context' adds N before/after lines around each match; 'tail' keeps the last N lines after grep/range.",
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string' },
         index: { type: 'number' },
         tail: { type: 'number' },
-        grep: { type: 'string' }
+        grep: { type: 'string' },
+        range: { type: 'array', items: { type: 'number' }, minItems: 2, maxItems: 2 },
+        context: { type: 'number' }
       },
       additionalProperties: false
     }
   },
   {
     name: 'terminal_read_all',
-    description: "Read recent output from every terminal, labelled by name.",
+    description: "Read every terminal, returns [{name, totalLines, lines:[{lineNumber,text},...]}]. Same options as terminal_read except no name/index targeting.",
     inputSchema: {
       type: 'object',
       properties: {
         tail: { type: 'number' },
-        grep: { type: 'string' }
+        grep: { type: 'string' },
+        range: { type: 'array', items: { type: 'number' }, minItems: 2, maxItems: 2 },
+        context: { type: 'number' }
       },
       additionalProperties: false
     }
@@ -95,10 +99,22 @@ export function makeDispatcher(opts: {
       case 'terminal_read':
         return terminals.read(
           { name: args.name, index: args.index },
-          { tail: args.tail, grep: args.grep, stripAnsi: stripAnsi() }
+          {
+            tail: args.tail,
+            grep: args.grep,
+            range: args.range,
+            context: args.context,
+            stripAnsi: stripAnsi()
+          }
         );
       case 'terminal_read_all':
-        return terminals.readAll({ tail: args.tail, grep: args.grep, stripAnsi: stripAnsi() });
+        return terminals.readAll({
+          tail: args.tail,
+          grep: args.grep,
+          range: args.range,
+          context: args.context,
+          stripAnsi: stripAnsi()
+        });
       case 'problems_list':
         return problems.list({ severity: args.severity, pathContains: args.pathContains });
       case 'problems_summary':

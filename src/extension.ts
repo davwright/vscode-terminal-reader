@@ -41,6 +41,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
+  const version = (context.extension.packageJSON as { version?: string }).version ?? '0.0.0';
   const info: EndpointInfo = {
     pipeName,
     pipePath,
@@ -54,22 +55,114 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   writeEndpointFile(info);
 
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBar.text = '$(terminal) TR';
-  statusBar.tooltip = `Terminal Reader\nPipe: ${pipePath}\nWorkspace: ${wsRoot ?? '(none)'}`;
   statusBar.command = 'vscodeTerminalReader.showStatus';
   statusBar.show();
   context.subscriptions.push(statusBar);
 
+  // State drives status bar text/icon/colour and the click-through advice.
+  // - notRegistered: mcp.json missing entry → broken icon, advise registration.
+  // - registeredAwaitingClient: registered but no bridge has authed yet →
+  //   warn icon, advise restarting Claude Code.
+  // - ready: at least one authed client connected → terminal icon.
+  let regState: 'notRegistered' | 'registeredAwaitingClient' | 'ready' =
+    isRegisteredWithClaude(context) ? 'registeredAwaitingClient' : 'notRegistered';
+  const renderStatus = () => {
+    if (!statusBar) return;
+    if (regState === 'ready') {
+      statusBar.text = `$(terminal) TR v${version}`;
+      statusBar.backgroundColor = undefined;
+      statusBar.tooltip =
+        `Terminal Reader v${version} — connected\n` +
+        `Pipe: ${pipePath}\nWorkspace: ${wsRoot ?? '(none)'}`;
+    } else if (regState === 'registeredAwaitingClient') {
+      statusBar.text = `$(warning) TR v${version}`;
+      statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+      statusBar.tooltip =
+        `Terminal Reader v${version} — registered but Claude Code hasn't connected.\n` +
+        `Reload the VSCode window (Ctrl+Shift+P → "Developer: Reload Window") so the Claude Code extension picks up the MCP server.\n` +
+        `Pipe: ${pipePath}`;
+    } else {
+      statusBar.text = `$(error) TR v${version}`;
+      statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+      statusBar.tooltip =
+        `Terminal Reader v${version} — not registered with Claude Code.\n` +
+        `Click to retry registration, or run the "Terminal Reader: Register with Claude" command.\n` +
+        `Pipe: ${pipePath}`;
+    }
+  };
+  renderStatus();
+
   context.subscriptions.push(
-    vscode.commands.registerCommand('vscodeTerminalReader.showStatus', () => {
-      const lines = [
-        `Pipe: ${pipePath}`,
-        `Workspace: ${wsRoot ?? '(none)'}`,
-        `Extension host PID: ${extensionHostPid}`,
-        `Window PID: ${info.windowPid}`,
-        `Terminals: ${terminals.list().length}`
-      ];
-      vscode.window.showInformationMessage(lines.join('  •  '));
+    server.onClientAuthed(() => {
+      regState = 'ready';
+      renderStatus();
+    })
+  );
+
+  // Run registration off the activation path: file I/O on ~/.claude/mcp.json
+  // shouldn't stall the extension host. Use a sticky notification (action item
+  // keeps it open) and a \n so the message doesn't get cropped.
+  setImmediate(async () => {
+    try {
+      const changed = ensureRegisteredWithClaude(context);
+      if (regState !== 'ready') {
+        regState = 'registeredAwaitingClient';
+        renderStatus();
+      }
+      if (changed) {
+        const choice = await vscode.window.showInformationMessage(
+          "Terminal Reader: registered MCP server with Claude Code.\n" +
+          "Reload the VSCode window so the Claude Code extension picks up the new MCP server.",
+          'Reload window', 'Later'
+        );
+        if (choice === 'Reload window') {
+          await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        }
+      }
+    } catch (e: any) {
+      regState = 'notRegistered';
+      renderStatus();
+      void vscode.window.showWarningMessage(
+        `Terminal Reader: failed to register with Claude.\n${e?.message ?? e}`,
+        'Dismiss'
+      );
+    }
+  });
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('vscodeTerminalReader.showStatus', async () => {
+      const detail =
+        `v${version}  •  Pipe: ${pipePath}  •  Workspace: ${wsRoot ?? '(none)'}  •  ` +
+        `Extension host PID: ${extensionHostPid}  •  Window PID: ${info.windowPid}  •  ` +
+        `Terminals: ${terminals.list().length}  •  Authed clients: ${server?.authedClientCount ?? 0}`;
+      if (regState === 'ready') {
+        await vscode.window.showInformationMessage(
+          `Terminal Reader: connected.\n${detail}`,
+          'Got it'
+        );
+      } else if (regState === 'registeredAwaitingClient') {
+        const pick = await vscode.window.showWarningMessage(
+          "Terminal Reader is registered with Claude Code but no client has connected yet.\n" +
+          "Reload the VSCode window so the Claude Code extension picks up the MCP server.\n\n" + detail,
+          'Reload window', 'Dismiss'
+        );
+        if (pick === 'Reload window') {
+          await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        }
+      } else {
+        const pick = await vscode.window.showErrorMessage(
+          "Terminal Reader is not registered with Claude.\n" +
+          "Click 'Register' to write the MCP entry to ~/.claude/mcp.json, then restart Claude Code.\n\n" + detail,
+          'Register', 'Dismiss'
+        );
+        if (pick === 'Register') {
+          await registerWithClaude(context);
+          if (isRegisteredWithClaude(context)) {
+            regState = 'registeredAwaitingClient';
+            renderStatus();
+          }
+        }
+      }
     }),
     vscode.commands.registerCommand('vscodeTerminalReader.clearBuffers', () => {
       terminals.clear();
@@ -105,8 +198,12 @@ function getParentPid(): number {
   return typeof ppid === 'number' ? ppid : extensionHostPid;
 }
 
-function claudeMcpPath(): string {
-  return path.join(os.homedir(), '.claude', 'mcp.json');
+// User-scope MCP config for Claude Code. CLI and VSCode extension both read
+// this; CLAUDE_CONFIG_DIR overrides the home directory. See
+// ~/.claude/skills/claude-code-mcp/SKILL.md for the full reference.
+function claudeConfigPath(): string {
+  const dir = process.env.CLAUDE_CONFIG_DIR ?? os.homedir();
+  return path.join(dir, '.claude.json');
 }
 
 function bridgePath(context: vscode.ExtensionContext): string {
@@ -114,41 +211,118 @@ function bridgePath(context: vscode.ExtensionContext): string {
 }
 
 function readClaudeMcp(): any {
-  const file = claudeMcpPath();
+  const file = claudeConfigPath();
   if (!fs.existsSync(file)) return { mcpServers: {} };
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : { mcpServers: {} };
   } catch {
     return { mcpServers: {} };
   }
 }
 
 function writeClaudeMcp(data: any): void {
-  fs.mkdirSync(path.dirname(claudeMcpPath()), { recursive: true });
-  fs.writeFileSync(claudeMcpPath(), JSON.stringify(data, null, 2), 'utf8');
+  // Atomic write: ~/.claude.json may be open by Claude Code. Write to a temp
+  // sibling and rename so we never leave a half-written file behind.
+  const target = claudeConfigPath();
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = target + `.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(tmp, target);
 }
 
-async function registerWithClaude(context: vscode.ExtensionContext): Promise<void> {
+const SERVER_NAME = 'vscode-reader';
+
+function isRegisteredWithClaude(context: vscode.ExtensionContext): boolean {
+  const data = readClaudeMcp();
+  const existing = data?.mcpServers?.[SERVER_NAME];
+  return (
+    !!existing &&
+    existing.type === 'stdio' &&
+    existing.command === 'node' &&
+    Array.isArray(existing.args) &&
+    existing.args[0] === bridgePath(context)
+  );
+}
+
+function ensureRegisteredWithClaude(context: vscode.ExtensionContext): boolean {
+  // Migrate away from the old, wrong path: ~/.claude/mcp.json. Earlier
+  // versions wrote there, but Claude Code reads ~/.claude.json (top-level
+  // mcpServers = user scope). If the legacy file still has our entry, drop it
+  // so we don't leave dangling registrations behind.
+  cleanupLegacyMcpJson();
+
   const data = readClaudeMcp();
   data.mcpServers = data.mcpServers ?? {};
-  data.mcpServers['vscode-reader'] = {
+  const expected = {
     type: 'stdio',
     command: 'node',
     args: [bridgePath(context)]
   };
+  const existing = data.mcpServers[SERVER_NAME];
+  if (
+    existing &&
+    existing.type === expected.type &&
+    existing.command === expected.command &&
+    Array.isArray(existing.args) &&
+    existing.args.length === expected.args.length &&
+    existing.args[0] === expected.args[0]
+  ) {
+    return false;
+  }
+  data.mcpServers[SERVER_NAME] = expected;
   writeClaudeMcp(data);
-  vscode.window.showInformationMessage(
-    "Registered 'vscode-reader' MCP server with Claude. Restart Claude to pick it up."
-  );
+  return true;
+}
+
+function cleanupLegacyMcpJson(): void {
+  const legacy = path.join(os.homedir(), '.claude', 'mcp.json');
+  if (!fs.existsSync(legacy)) return;
+  try {
+    const raw = fs.readFileSync(legacy, 'utf8');
+    const data = JSON.parse(raw);
+    if (data?.mcpServers && data.mcpServers[SERVER_NAME]) {
+      delete data.mcpServers[SERVER_NAME];
+      fs.writeFileSync(legacy, JSON.stringify(data, null, 2), 'utf8');
+    }
+  } catch {
+    // Legacy file unreadable — leave it alone.
+  }
+}
+
+async function registerWithClaude(context: vscode.ExtensionContext): Promise<void> {
+  const changed = ensureRegisteredWithClaude(context);
+  if (changed) {
+    const pick = await vscode.window.showInformationMessage(
+      "Registered 'vscode-reader' MCP server with Claude Code.\n" +
+      "Reload the VSCode window so the Claude Code extension picks up the new MCP server.",
+      'Reload window', 'Later'
+    );
+    if (pick === 'Reload window') {
+      await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    }
+  } else {
+    await vscode.window.showInformationMessage(
+      "'vscode-reader' is already registered with Claude Code.",
+      'Got it'
+    );
+  }
 }
 
 async function unregisterFromClaude(): Promise<void> {
+  cleanupLegacyMcpJson();
   const data = readClaudeMcp();
-  if (data?.mcpServers && data.mcpServers['vscode-reader']) {
-    delete data.mcpServers['vscode-reader'];
+  if (data?.mcpServers && data.mcpServers[SERVER_NAME]) {
+    delete data.mcpServers[SERVER_NAME];
     writeClaudeMcp(data);
-    vscode.window.showInformationMessage("Unregistered 'vscode-reader' MCP server.");
+    await vscode.window.showInformationMessage(
+      `Unregistered '${SERVER_NAME}' MCP server.`,
+      'Got it'
+    );
   } else {
-    vscode.window.showInformationMessage("'vscode-reader' was not registered.");
+    await vscode.window.showInformationMessage(
+      `'${SERVER_NAME}' was not registered.`,
+      'Got it'
+    );
   }
 }

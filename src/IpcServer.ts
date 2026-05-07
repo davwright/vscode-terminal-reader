@@ -19,6 +19,11 @@ interface JsonRpcResponse {
 
 export class IpcServer implements vscode.Disposable {
   private server: net.Server | null = null;
+  private readonly _onClientAuthed = new vscode.EventEmitter<void>();
+  readonly onClientAuthed = this._onClientAuthed.event;
+  private _authedClientCount = 0;
+  get authedClientCount(): number { return this._authedClientCount; }
+  get isListening(): boolean { return this.server?.listening === true; }
 
   constructor(
     private readonly pipePath: string,
@@ -49,8 +54,17 @@ export class IpcServer implements vscode.Disposable {
         buf = buf.slice(nl + 1);
         nl = buf.indexOf('\n');
         if (!line.trim()) continue;
-        await this.processLine(socket, line, () => authed, (v) => (authed = v));
+        await this.processLine(socket, line, () => authed, (v) => {
+          if (v && !authed) {
+            this._authedClientCount++;
+            this._onClientAuthed.fire();
+          }
+          authed = v;
+        });
       }
+    });
+    socket.on('close', () => {
+      if (authed) this._authedClientCount = Math.max(0, this._authedClientCount - 1);
     });
     socket.on('error', () => {
       try {
@@ -119,5 +133,6 @@ export class IpcServer implements vscode.Disposable {
       }
       this.server = null;
     }
+    this._onClientAuthed.dispose();
   }
 }

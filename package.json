@@ -2,8 +2,13 @@
   "name": "vscode-terminal-reader",
   "displayName": "Terminal Reader for Claude",
   "description": "Lets Claude Code read this VSCode window's terminals, problems, debug, tasks, and ports via a local MCP server.",
-  "version": "0.0.1",
+  "version": "0.0.10",
   "publisher": "dwrigh",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/davwright/vscode-terminal-reader.git"
+  },
   "engines": {
     "vscode": "^1.93.0"
   },
@@ -53,10 +58,14 @@
     "compile": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "watch": "npm run compile -- --watch",
     "lint": "tsc --noEmit",
-    "package": "npm run compile -- --minify",
-    "vsix": "npx @vscode/vsce package --no-dependencies"
+    "icon": "node scripts/build-icon.js",
+    "bump": "npm version patch --no-git-tag-version",
+    "package": "npm run icon && npm run compile -- --minify",
+    "vsix": "npx @vscode/vsce package --no-dependencies",
+    "install-ext": "npm run bump && npm run package && npm run vsix && node scripts/install-vsix.js"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.93.0",
     "esbuild": "^0.20.0",

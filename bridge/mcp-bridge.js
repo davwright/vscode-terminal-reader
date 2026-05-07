@@ -18,7 +18,6 @@ const fs = require('fs');
 const net = require('net');
 const os = require('os');
 const path = require('path');
-const { execSync } = require('child_process');
 
 const log = (...args) => {
   if (process.env.VSCODE_TR_DEBUG) {
@@ -61,55 +60,20 @@ function isPidAlive(pid) {
   }
 }
 
-function ancestorPids() {
-  const pids = new Set();
-  let pid = process.ppid;
-  for (let i = 0; i < 12 && pid && pid > 0; i++) {
-    pids.add(pid);
-    try {
-      pid = parentOf(pid);
-    } catch (_) {
-      break;
-    }
-  }
-  return pids;
-}
-
-function parentOf(pid) {
-  if (process.platform === 'win32') {
-    try {
-      const out = execSync(
-        `wmic process where ProcessId=${pid} get ParentProcessId /value`,
-        { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' }
-      );
-      const m = out.match(/ParentProcessId=(\d+)/);
-      return m ? Number(m[1]) : 0;
-    } catch (_) {
-      return 0;
-    }
-  }
-  try {
-    const out = execSync(`ps -o ppid= -p ${pid}`, { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' });
-    return Number(out.trim()) || 0;
-  } catch (_) {
-    return 0;
-  }
-}
-
 function pickEndpoint() {
   const eps = listEndpoints();
-  if (eps.length === 0) return null;
-  if (eps.length === 1) return eps[0];
-
+  if (eps.length === 0) {
+    throw new Error('no running VSCode Terminal Reader extension found (no endpoint files)');
+  }
   const cwd = process.cwd();
-  const cwdMatch = eps.find((e) => e.workspaceRoot && (cwd === e.workspaceRoot || cwd.startsWith(e.workspaceRoot + path.sep)));
-  if (cwdMatch) return cwdMatch;
-
-  const ancestors = ancestorPids();
-  const ancestorMatch = eps.find((e) => ancestors.has(e.windowPid));
-  if (ancestorMatch) return ancestorMatch;
-
-  return eps.sort((a, b) => b.startedAt - a.startedAt)[0];
+  const matches = eps
+    .filter((e) => e.workspaceRoot && (cwd === e.workspaceRoot || cwd.startsWith(e.workspaceRoot + path.sep)))
+    .sort((a, b) => b.workspaceRoot.length - a.workspaceRoot.length);
+  if (matches.length === 0) {
+    const known = eps.map((e) => e.workspaceRoot || '(no workspace)').join(', ');
+    throw new Error(`no VSCode window has cwd '${cwd}' inside its workspace; running workspaces: ${known}`);
+  }
+  return matches[0];
 }
 
 // ---- IPC client ----
@@ -168,7 +132,6 @@ function makeError(id, code, message) {
 async function ensureConnected(state) {
   if (state.sock && !state.sock.destroyed) return state.sock;
   const ep = pickEndpoint();
-  if (!ep) throw new Error('no running VSCode Terminal Reader extension found');
   const sock = await connect(ep);
   await sendRpc(sock, 'auth', { token: ep.token });
   state.sock = sock;

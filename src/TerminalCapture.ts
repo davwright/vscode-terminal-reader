@@ -1,5 +1,19 @@
 import * as vscode from 'vscode';
-import { RingBuffer, stripAnsi } from './RingBuffer';
+import { RingBuffer, NumberedLine, stripAnsi } from './RingBuffer';
+
+export interface ReadOpts {
+  tail?: number;
+  grep?: string;
+  range?: [number, number];
+  context?: number;
+  stripAnsi?: boolean;
+}
+
+export interface ReadResult {
+  name: string;
+  totalLines: number;
+  lines: NumberedLine[];
+}
 
 interface TerminalEntry {
   terminal: vscode.Terminal;
@@ -82,8 +96,8 @@ export class TerminalCapture implements vscode.Disposable {
 
   read(
     target: { name?: string; index?: number },
-    opts: { tail?: number; grep?: string; stripAnsi?: boolean } = {}
-  ): { name: string; lines: string[] } | { error: string } {
+    opts: ReadOpts = {}
+  ): ReadResult | { error: string } {
     const list = Array.from(this.entries.values());
     let entry: TerminalEntry | undefined;
     if (target.name) {
@@ -94,21 +108,29 @@ export class TerminalCapture implements vscode.Disposable {
       entry = list[list.length - 1];
     }
     if (!entry) return { error: 'terminal not found' };
-
-    let lines = entry.buffer.read({ tail: opts.tail, grep: opts.grep });
-    if (opts.stripAnsi !== false) lines = lines.map(stripAnsi);
-    return { name: entry.terminal.name, lines };
+    return this.formatRead(entry, opts);
   }
 
-  readAll(opts: { tail?: number; grep?: string; stripAnsi?: boolean } = {}): Array<{
-    name: string;
-    lines: string[];
-  }> {
-    return Array.from(this.entries.values()).map((entry) => {
-      let lines = entry.buffer.read({ tail: opts.tail, grep: opts.grep });
-      if (opts.stripAnsi !== false) lines = lines.map(stripAnsi);
-      return { name: entry.terminal.name, lines };
+  readAll(opts: ReadOpts = {}): ReadResult[] {
+    return Array.from(this.entries.values()).map((entry) => this.formatRead(entry, opts));
+  }
+
+  private formatRead(entry: TerminalEntry, opts: ReadOpts): ReadResult {
+    const matches = entry.buffer.read({
+      tail: opts.tail,
+      grep: opts.grep,
+      range: opts.range,
+      context: opts.context
     });
+    const stripped =
+      opts.stripAnsi !== false
+        ? matches.map((m) => ({ lineNumber: m.lineNumber, text: stripAnsi(m.text) }))
+        : matches;
+    return {
+      name: entry.terminal.name,
+      totalLines: entry.buffer.nextLineNumber() - 1,
+      lines: stripped
+    };
   }
 
   clear(): void {
