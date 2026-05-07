@@ -1,0 +1,65 @@
+{
+  "name": "vscode-terminal-reader",
+  "displayName": "Terminal Reader for Claude",
+  "description": "Lets Claude Code read this VSCode window's terminals, problems, debug, tasks, and ports via a local MCP server.",
+  "version": "0.0.1",
+  "publisher": "dwrigh",
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vscodeTerminalReader.register",
+        "title": "Terminal Reader: Register MCP server with Claude"
+      },
+      {
+        "command": "vscodeTerminalReader.unregister",
+        "title": "Terminal Reader: Unregister MCP server"
+      },
+      {
+        "command": "vscodeTerminalReader.showStatus",
+        "title": "Terminal Reader: Show status"
+      },
+      {
+        "command": "vscodeTerminalReader.clearBuffers",
+        "title": "Terminal Reader: Clear all buffers"
+      }
+    ],
+    "configuration": {
+      "title": "Terminal Reader",
+      "properties": {
+        "vscodeTerminalReader.bufferLines": {
+          "type": "number",
+          "default": 10000,
+          "description": "Maximum lines to retain per terminal/output buffer."
+        },
+        "vscodeTerminalReader.stripAnsi": {
+          "type": "boolean",
+          "default": true,
+          "description": "Strip ANSI escape codes when reading buffers."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "watch": "npm run compile -- --watch",
+    "lint": "tsc --noEmit",
+    "package": "npm run compile -- --minify",
+    "vsix": "npx @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.93.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  }
+}
