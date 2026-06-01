@@ -60,6 +60,11 @@ interface TerminalEntry {
   lastExitCode?: number;
   lastCommandStartedAt?: number;
   lastCommandFinishedAt?: number;
+  // Hooks fired by onDidEndTerminalShellExecution and appendRaw so waitForIdle
+  // can resolve event-driven (no polling). Cleared after each fire — waiters
+  // re-register themselves if they want subsequent events.
+  endWaiters: Array<(exitCode: number | undefined) => void>;
+  appendWaiters: Array<(chunk: string) => void>;
 }
 
 const RAW_BUFFER_MAX_BYTES = 1024 * 1024; // 1 MiB rolling raw stream per terminal
@@ -110,6 +115,10 @@ export class TerminalCapture implements vscode.Disposable {
         const endMarker = `■ exit ${e.exitCode ?? '?'}\n`;
         entry.buffer.append(endMarker);
         this.appendRaw(entry, endMarker);
+        if (entry.endWaiters.length) {
+          const waiters = entry.endWaiters.splice(0);
+          for (const w of waiters) w(e.exitCode);
+        }
       })
     );
   }
@@ -122,7 +131,9 @@ export class TerminalCapture implements vscode.Disposable {
       rawBuffer: '',
       rawBytes: 0,
       shellIntegrationActive: !!terminal.shellIntegration,
-      busy: false
+      busy: false,
+      endWaiters: [],
+      appendWaiters: []
     });
   }
 
@@ -132,6 +143,10 @@ export class TerminalCapture implements vscode.Disposable {
     if (entry.rawBuffer.length > RAW_BUFFER_MAX_BYTES) {
       const overflow = entry.rawBuffer.length - RAW_BUFFER_MAX_BYTES;
       entry.rawBuffer = entry.rawBuffer.slice(overflow);
+    }
+    if (entry.appendWaiters.length) {
+      const waiters = entry.appendWaiters.splice(0);
+      for (const w of waiters) w(chunk);
     }
   }
 
@@ -213,6 +228,214 @@ export class TerminalCapture implements vscode.Disposable {
     } catch (e: any) {
       return { sent: false, reason: e?.message ?? String(e) };
     }
+  }
+
+  /**
+   * Current working directory of the target terminal, when shell integration
+   * has reported one. Returns undefined when integration is off or hasn't yet
+   * fired a CWD update.
+   */
+  cwdOf(target: { name?: string; index?: number } = {}): string | undefined {
+    const entry = this.resolve(target);
+    return entry?.terminal.shellIntegration?.cwd?.fsPath;
+  }
+
+  /**
+   * Detect the shell of a target terminal. Uses creationOptions.shellPath
+   * when available, falling back to the platform default. Returns 'bash'
+   * if detection fails — see Permissions for the namespace mapping.
+   */
+  detectShell(target: { name?: string; index?: number } = {}): 'powershell' | 'bash' | null {
+    const entry = this.resolve(target);
+    if (!entry) return null;
+    const opts = entry.terminal.creationOptions as { shellPath?: string } | undefined;
+    const shellPath = opts?.shellPath?.toLowerCase() ?? '';
+    if (shellPath.includes('pwsh') || shellPath.includes('powershell')) return 'powershell';
+    if (shellPath.includes('bash') || shellPath.includes('zsh') || shellPath.includes('sh') || shellPath.includes('fish')) {
+      return 'bash';
+    }
+    // No explicit shellPath: fall back to platform default. On Windows the
+    // default integrated terminal is PowerShell; elsewhere it's bash-family.
+    return process.platform === 'win32' ? 'powershell' : 'bash';
+  }
+
+  /**
+   * Send a command to the target terminal after the caller has already
+   * approved it. Returns the line number where the command's output will
+   * begin, so the caller can subsequently terminal_read({range:[runId, ...]})
+   * to slice exactly this run's output. Buffer clear is the caller's
+   * responsibility — this method does no permission checking and no clearing.
+   */
+  run(
+    target: { name?: string; index?: number },
+    command: string,
+    addNewline: boolean
+  ): { sent: boolean; name?: string; runId?: number; reason?: string } {
+    const entry = this.resolve(target);
+    if (!entry) return { sent: false, reason: 'terminal not found' };
+    const runId = entry.buffer.nextLineNumber();
+    try {
+      entry.terminal.sendText(command, addNewline);
+      return { sent: true, name: entry.terminal.name, runId };
+    } catch (e: any) {
+      return { sent: false, reason: e?.message ?? String(e) };
+    }
+  }
+
+  /**
+   * Block until the target terminal finishes its current command, a pattern
+   * matches new output, the timeout elapses, or (when returnOnNonZeroExitFast)
+   * a non-zero exit is reported.
+   *
+   * Event-driven via onDidEndTerminalShellExecution + appendRaw hooks — no
+   * polling. Resolves quickly if the terminal is already idle.
+   *
+   * Shell integration off → resolves `reason: 'unsupported'` immediately,
+   * because OSC 633 D-marks are the only reliable end-of-command signal.
+   */
+  async waitForIdle(
+    target: { name?: string; index?: number },
+    opts: {
+      timeoutMs: number;
+      returnOnPattern?: string;
+      returnOnPatternFlags?: string;
+      // Lines below this number are ignored for pattern matching. Use the
+      // runId returned by run() so we don't match against pre-existing output.
+      patternStartLine?: number;
+    }
+  ): Promise<{
+    reason: 'finished' | 'pattern' | 'timeout' | 'unsupported' | 'invalid-pattern';
+    name?: string;
+    exitCode?: number;
+    matchedLine?: { lineNumber: number; text: string };
+    totalLines: number;
+    elapsedMs: number;
+    error?: string;
+  }> {
+    const entry = this.resolve(target);
+    if (!entry) {
+      return { reason: 'timeout', totalLines: 0, elapsedMs: 0 };
+    }
+    const started = Date.now();
+    const totalNow = () => entry.buffer.nextLineNumber() - 1;
+    if (!entry.shellIntegrationActive) {
+      return {
+        reason: 'unsupported',
+        name: entry.terminal.name,
+        totalLines: totalNow(),
+        elapsedMs: 0
+      };
+    }
+    // Already idle, and not waiting for a pattern? Return immediately.
+    if (!entry.busy && !opts.returnOnPattern) {
+      return {
+        reason: 'finished',
+        name: entry.terminal.name,
+        exitCode: entry.lastExitCode,
+        totalLines: totalNow(),
+        elapsedMs: 0
+      };
+    }
+
+    // Compile defensively — a bad regex from the caller shouldn't crash the
+    // IPC. Return a clean typed error instead.
+    let re: RegExp | null = null;
+    if (opts.returnOnPattern) {
+      try {
+        re = new RegExp(opts.returnOnPattern, opts.returnOnPatternFlags ?? 'i');
+      } catch (e: any) {
+        return {
+          reason: 'invalid-pattern',
+          name: entry.terminal.name,
+          error: e?.message ?? String(e),
+          totalLines: totalNow(),
+          elapsedMs: Date.now() - started
+        };
+      }
+    }
+    // ANSI escapes are stored in the buffer as-is (stripping happens on read).
+    // Strip before testing so patterns like /^error/ don't trip over a leading
+    // \x1b[31m. Substring matches still work either way.
+    const testLine = (text: string) => re!.test(stripAnsi(text));
+    // Scan output already buffered between patternStartLine and now — the caller
+    // may have run a command and we may already have new output before
+    // waitForIdle is entered (the bridge → IPC hop is async). When no
+    // patternStartLine is supplied, scan from the buffer's first line — better
+    // to match a line we shouldn't have seen than to miss the only match.
+    if (re) {
+      const startFrom = opts.patternStartLine ?? 1;
+      const existing = entry.buffer.read({ range: [startFrom, totalNow()] });
+      for (const l of existing) {
+        if (testLine(l.text)) {
+          return {
+            reason: 'pattern',
+            name: entry.terminal.name,
+            matchedLine: l,
+            totalLines: totalNow(),
+            elapsedMs: Date.now() - started
+          };
+        }
+      }
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (result: Parameters<typeof resolve>[0]) => {
+        if (settled) return;
+        settled = true;
+        // Best-effort cleanup — splice the waiter slots so a long-lived terminal
+        // doesn't accumulate stale entries from timed-out waits.
+        const ei = entry.endWaiters.indexOf(onEnd);
+        if (ei >= 0) entry.endWaiters.splice(ei, 1);
+        const ai = entry.appendWaiters.indexOf(onAppend);
+        if (ai >= 0) entry.appendWaiters.splice(ai, 1);
+        clearTimeout(timer);
+        resolve(result);
+      };
+      const onEnd = (exitCode: number | undefined) => {
+        finish({
+          reason: 'finished',
+          name: entry.terminal.name,
+          exitCode,
+          totalLines: totalNow(),
+          elapsedMs: Date.now() - started
+        });
+      };
+      const onAppend = (_chunk: string) => {
+        if (!re) return;
+        // Re-register so we keep getting notifications until we settle.
+        if (!settled) entry.appendWaiters.push(onAppend);
+        // Scan newly appended lines from patternStartLine (or buffer start) to
+        // now. RingBuffer.read with a range is cheap — O(n) over the slice.
+        const startFrom = opts.patternStartLine ?? 1;
+        const recent = entry.buffer.read({ range: [startFrom, totalNow()] });
+        for (const l of recent) {
+          if (testLine(l.text)) {
+            finish({
+              reason: 'pattern',
+              name: entry.terminal.name,
+              matchedLine: l,
+              totalLines: totalNow(),
+              elapsedMs: Date.now() - started
+            });
+            return;
+          }
+        }
+      };
+      entry.endWaiters.push(onEnd);
+      // Only register the append listener when we actually have a pattern —
+      // otherwise we'd accumulate a no-op listener that just re-registers
+      // itself on every chunk.
+      if (re) entry.appendWaiters.push(onAppend);
+      const timer = setTimeout(() => {
+        finish({
+          reason: 'timeout',
+          name: entry.terminal.name,
+          totalLines: totalNow(),
+          elapsedMs: Date.now() - started
+        });
+      }, opts.timeoutMs);
+    });
   }
 
   private formatRead(entry: TerminalEntry, opts: ReadOpts): ReadResult {

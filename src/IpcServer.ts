@@ -21,6 +21,11 @@ export class IpcServer implements vscode.Disposable {
   private server: net.Server | null = null;
   private readonly _onClientAuthed = new vscode.EventEmitter<void>();
   readonly onClientAuthed = this._onClientAuthed.event;
+  private readonly _onVersionMismatch = new vscode.EventEmitter<string>();
+  // Fires with the client's reported version when it is newer than the host's
+  // own version — i.e. the user installed a newer .vsix but hasn't reloaded
+  // the VSCode window yet, so the running extension is stale.
+  readonly onVersionMismatch = this._onVersionMismatch.event;
   private _authedClientCount = 0;
   get authedClientCount(): number { return this._authedClientCount; }
   get isListening(): boolean { return this.server?.listening === true; }
@@ -28,7 +33,8 @@ export class IpcServer implements vscode.Disposable {
   constructor(
     private readonly pipePath: string,
     private readonly token: string,
-    private readonly handler: RpcHandler
+    private readonly handler: RpcHandler,
+    private readonly hostVersion: string
   ) {}
 
   async listen(): Promise<void> {
@@ -92,6 +98,10 @@ export class IpcServer implements vscode.Disposable {
     if (!isAuthed()) {
       if (req.method === 'auth' && (req.params as any)?.token === this.token) {
         setAuthed(true);
+        const clientVersion = (req.params as any)?.clientVersion;
+        if (typeof clientVersion === 'string' && compareVersions(clientVersion, this.hostVersion) > 0) {
+          this._onVersionMismatch.fire(clientVersion);
+        }
         this.send(socket, { jsonrpc: '2.0', id: req.id ?? null, result: { ok: true } });
       } else {
         this.send(socket, {
@@ -134,5 +144,26 @@ export class IpcServer implements vscode.Disposable {
       this.server = null;
     }
     this._onClientAuthed.dispose();
+    this._onVersionMismatch.dispose();
   }
+}
+
+// Returns >0 if a is newer than b, <0 if older, 0 if equal. Non-numeric or
+// missing parts are treated as 0. Pre-release tags are ignored — splits on
+// '-' / '+' and compares only the leading numeric triple.
+export function compareVersions(a: string, b: string): number {
+  const parse = (s: string) =>
+    s.split(/[-+]/)[0].split('.').map((p) => {
+      const n = parseInt(p, 10);
+      return Number.isFinite(n) ? n : 0;
+    });
+  const ap = parse(a);
+  const bp = parse(b);
+  const len = Math.max(ap.length, bp.length);
+  for (let i = 0; i < len; i++) {
+    const av = ap[i] ?? 0;
+    const bv = bp[i] ?? 0;
+    if (av !== bv) return av - bv;
+  }
+  return 0;
 }

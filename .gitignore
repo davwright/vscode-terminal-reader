@@ -5,3 +5,4 @@ dist/
 # Personal/local config — do not commit
 .vscode/
 .claude/settings.local.json
+dist-test/

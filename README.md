@@ -38,11 +38,13 @@ If the status bar icon stays yellow or red, click it — the tooltip and one-cli
 
 ## How Claude knows what it can do
 
-You don't have to teach Claude anything. The extension exposes itself as an MCP server, and on first connection Claude calls `tools/list` and reads the tool descriptions and input schemas the extension ships with. From that point on Claude knows the eight tools below, what each one returns, and how to combine them — for the lifetime of every future Claude session in that VSCode window.
+You don't have to teach Claude anything. The extension exposes itself as an MCP server, and on first connection Claude calls `tools/list` and reads the tool descriptions and input schemas the extension ships with. From that point on Claude knows the tools below, what each one returns, and how to combine them — for the lifetime of every future Claude session in that VSCode window.
 
 ## What Claude can do
 
-Eight tools, all under the `mcp__vscode-reader__*` namespace:
+All tools live under the `mcp__vscode-reader__*` namespace.
+
+### Terminals and problems
 
 | Tool                  | What it does                                                                |
 |-----------------------|------------------------------------------------------------------------------|
@@ -50,10 +52,30 @@ Eight tools, all under the `mcp__vscode-reader__*` namespace:
 | `terminal_read`       | Reads output. Supports server-side regex, line ranges, context, three formats |
 | `terminal_read_all`   | Same, but across every terminal at once                                      |
 | `terminal_state`      | Just the metadata — busy/idle, last command, exit code, line counts          |
+| `terminal_run`        | Runs a command in a terminal, gated by your `.claude/settings.local.json` allow/deny rules. Pass `wait:true` to block until it finishes |
+| `terminal_wait`       | Blocks until a terminal finishes its current command, a regex matches new output, or timeout. Defaults: 60 s, max 5 min |
 | `terminal_interrupt`  | Sends Ctrl-C to abort a runaway command                                       |
 | `terminal_clear`      | Clears the captured buffer (your visible terminal isn't touched)              |
 | `problems_list`       | Diagnostics from VSCode's Problems panel                                      |
 | `problems_summary`    | Counts and top files                                                          |
+
+### Embedded browser
+
+The extension can spawn a Chrome or Edge tab and let Claude inspect it — read the DOM, watch the console, evaluate JavaScript, take screenshots. A sample page lives at [samples/embedded-browser/](samples/embedded-browser/) so you can try it.
+
+| Tool                     | What it does                                                                  |
+|--------------------------|--------------------------------------------------------------------------------|
+| `browser_open`           | Launches Chrome/Edge and navigates to a URL or workspace-relative file         |
+| `browser_navigate`       | Navigates the already-open tab to a new page                                   |
+| `browser_eval`           | Evaluates a JS expression in the page (`returnByValue`/`awaitPromise` default on) |
+| `browser_console_read`   | Reads captured `console.log`/`warn`/`error` + uncaught exceptions, same grep/range/tail as `terminal_read` |
+| `browser_dom_snapshot`   | Compact JSON tree of the live DOM (depth-limited)                              |
+| `browser_query_selector` | CSS-selector lookup; returns `{tag, id, classes, text, attrs, html}`           |
+| `browser_screenshot`     | PNG/JPEG of the viewport, full page, or a single selector                      |
+| `browser_close`          | Tears down the browser tab                                                     |
+| `browser_status`         | `{running, browser?, url?, consoleLines}` without driving anything             |
+
+Browser is **CDP over WebSocket** — no Puppeteer, no Playwright, no extra dependencies. It binds to `127.0.0.1` only, the child process dies with the extension host, and the user-data-dir is a fresh temp dir per spawn. Try [samples/embedded-browser/README.md](samples/embedded-browser/README.md) for a five-prompt walkthrough.
 
 ## Highlights
 
@@ -68,6 +90,51 @@ Eight tools, all under the `mcp__vscode-reader__*` namespace:
 **Multi-window safe.** Each VSCode window has its own private channel. Multiple windows side by side don't bleed into each other.
 
 **Zero copy-paste.** That's the whole point.
+
+## Running commands (`terminal_run`)
+
+`terminal_run` lets Claude execute commands in your terminal, **gated by an allow/deny list you control**. The point isn't to give Claude broad shell access — it's to let Claude run something verbose (a build, a test suite, a diagnostic dump) and then use `terminal_read`'s grep/range/format tools to find the few lines it actually needs. You spend tokens on the answer, not on streaming megabytes of build output back through tool calls. And because everything goes through the terminal you can see, you watch what Claude does in real time.
+
+By default, `terminal_run` clears the terminal's line-number buffer before sending the command, so a follow-up `terminal_read` returns only this run's output. Your visible terminal scrollback is never touched. Pass `clearFirst: false` to keep prior output addressable.
+
+### Permission rules
+
+Edit `<your-workspace>/.claude/settings.local.json`. The extension reads this file on every `terminal_run` call (no daemon restart needed):
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm test*)",
+      "Bash(npm run build*)",
+      "PowerShell(Get-ChildItem*)"
+    ],
+    "deny": [
+      "Bash(rm *)",
+      "Bash(git push*)"
+    ]
+  }
+}
+```
+
+- **Same file, same grammar as Claude Code itself.** One source of truth — anything you've authorised for Claude's own Bash tool also works through `terminal_run`. See [Claude Code's permission docs](https://code.claude.com/docs/en/permissions) for the full rule grammar.
+- **Default deny.** No matching allow rule → command is rejected.
+- **Deny wins.** A deny match overrides any allow.
+- **Compound commands are split.** `npm test && rm -rf node_modules` only runs if *both* sub-commands have an allow rule. Splits on `&&`, `||`, `;`, `|`, `&`, newline.
+- **Shell-aware.** Rules under `Bash(...)` apply to bash/zsh/fish terminals; `PowerShell(...)` applies to pwsh/PowerShell. The extension picks the namespace per terminal.
+
+### Deferred from the full Claude Code spec
+
+This is a deliberate subset. Currently *not* implemented:
+
+- User-level (`~/.claude/settings.json`) and managed/policy settings layers
+- `permissions.ask` rules (treated as deny — there's no MCP UI to prompt through)
+- Process-wrapper stripping (so `Bash(npm test *)` won't auto-match `timeout 30 npm test` — write a more permissive rule, or wrap in your own script)
+- PowerShell alias canonicalisation (`gci` won't match `Get-ChildItem` rules)
+- Read-only command auto-approve (you must explicitly allow `ls`, `cat`, etc.)
+- Hot-reload via `fs.watch` (file is re-read on every call instead, which costs a JSON parse and avoids a class of stale-cache bugs)
+
+If any of these become annoying, [open an issue](https://github.com/davwright/vscode-terminal-reader/issues) — see [#3](https://github.com/davwright/vscode-terminal-reader/issues/3) for the full target spec.
 
 ## Settings
 

@@ -102,10 +102,12 @@ export class RingBuffer {
   }
 
   clear(): void {
+    // Advance past discarded lines so subsequent appends get fresh numbers,
+    // never the same numbers the cleared lines had. clear() is a special
+    // case of eviction — same invariant applies.
+    this.firstLineNumber += this.lines.length;
     this.lines = [];
     this.partial = '';
-    // Don't reset firstLineNumber — keep numbers monotonic across clears so
-    // subsequent reads can't accidentally collide with old cached numbers.
   }
 }
 

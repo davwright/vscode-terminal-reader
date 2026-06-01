@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Terminal Reader — embedded browser sample</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <img src="logo.svg" alt="logo" width="48" height="48" />
+      <h1>Embedded browser sample</h1>
+    </header>
+    <main>
+      <p>
+        This page exists so Claude can prove it can drive an embedded browser via the
+        Terminal Reader extension. Open the extension's
+        <code>browser_*</code> MCP tools to interact with it.
+      </p>
+      <section class="counter">
+        <button id="incr" type="button">Increment</button>
+        <span>Counter: <span id="count">0</span></span>
+      </section>
+      <section class="state">
+        <h2>State exposed to Claude</h2>
+        <pre id="state-dump">loading…</pre>
+      </section>
+      <section class="log">
+        <h2>Local log</h2>
+        <ul id="log"></ul>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

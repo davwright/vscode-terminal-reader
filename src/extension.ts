@@ -5,8 +5,12 @@ import * as fs from 'fs';
 import * as os from 'os';
 import { TerminalCapture } from './TerminalCapture';
 import { ProblemsCapture } from './ProblemsCapture';
-import { IpcServer } from './IpcServer';
+import { IpcServer, compareVersions } from './IpcServer';
 import { makeDispatcher } from './McpHandlers';
+import { Permissions } from './Permissions';
+import { HookRunner } from './HookRunner';
+import { HookInstaller } from './HookInstaller';
+import { BrowserController } from './browser/BrowserController';
 import {
   buildPipeName,
   deleteEndpointFile,
@@ -17,6 +21,7 @@ import {
 let server: IpcServer | null = null;
 let extensionHostPid = process.pid;
 let statusBar: vscode.StatusBarItem | null = null;
+let shieldBar: vscode.StatusBarItem | null = null;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const cfg = () => vscode.workspace.getConfiguration('vscodeTerminalReader');
@@ -27,12 +32,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const problems = new ProblemsCapture();
   context.subscriptions.push(terminals);
 
-  const dispatch = makeDispatcher({ terminals, problems, stripAnsi });
+  // Permissions reads <workspaceRoot>/.claude/settings.local.json on every
+  // terminal_run call. workspaceFolders[0] matches the rest of the extension's
+  // single-root assumption.
+  const permWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
+  const permissions = new Permissions(permWorkspace);
+
+  const browser = new BrowserController(permWorkspace, maxLines);
+  context.subscriptions.push({ dispose: () => browser.dispose() });
+
+  // HookRunner replays the user's ~/.claude/settings.json PreToolUse hooks
+  // against each terminal_run, closing the side-door past hooks that match
+  // on "Bash" / "PowerShell". HookInstaller keeps the two vendored scripts
+  // (block-git-write, block-python) on disk and registered.
+  const hooks = new HookRunner();
+  const installer = new HookInstaller(context.extensionPath);
+
+  const dispatch = makeDispatcher({
+    terminals,
+    problems,
+    permissions,
+    hooks,
+    stripAnsi,
+    browser,
+    workspaceRoot: permWorkspace
+  });
 
   const { pipeName, pipePath } = buildPipeName(extensionHostPid);
   const token = crypto.randomBytes(16).toString('hex');
+  const version = (context.extension.packageJSON as { version?: string }).version ?? '0.0.0';
 
-  server = new IpcServer(pipePath, token, dispatch);
+  server = new IpcServer(pipePath, token, dispatch, version);
   try {
     await server.listen();
   } catch (e: any) {
@@ -41,7 +71,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
-  const version = (context.extension.packageJSON as { version?: string }).version ?? '0.0.0';
   const info: EndpointInfo = {
     pipeName,
     pipePath,
@@ -59,6 +88,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusBar.show();
   context.subscriptions.push(statusBar);
 
+  // Separate shield indicator: tells the user at a glance which PreToolUse
+  // hooks would fire on the next terminal_run. Gold/yellow when any blocking
+  // hooks are armed; hidden when no PreToolUse/Bash hooks are configured.
+  shieldBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+  shieldBar.command = 'vscodeTerminalReader.showHookStatus';
+  shieldBar.color = new vscode.ThemeColor('charts.yellow');
+  context.subscriptions.push(shieldBar);
+  const renderShield = () => {
+    if (!shieldBar) return;
+    const bashHooks = hooks.listActiveHooks('bash');
+    const psHooks = hooks.listActiveHooks('powershell');
+    const all = [...bashHooks, ...psHooks];
+    if (all.length === 0) {
+      shieldBar.hide();
+      return;
+    }
+    shieldBar.text = `$(shield) ${bashHooks.length + psHooks.length}`;
+    const lines: string[] = [
+      `Terminal Reader: ${all.length} PreToolUse hook${all.length === 1 ? '' : 's'} armed.`,
+      `These run before every terminal_run (and on direct Bash/PowerShell tool calls).`,
+      ''
+    ];
+    const fmt = (label: string, list: typeof bashHooks) => {
+      if (list.length === 0) return;
+      lines.push(`${label}:`);
+      for (const h of list) {
+        const present = h.resolvedPath ? `✓ ${h.resolvedPath}` : `⚠ not found on disk`;
+        lines.push(`  • [${h.matcher || '*'}] ${h.command}`);
+        lines.push(`      ${present}  (timeout ${h.timeoutSeconds}s)`);
+      }
+    };
+    fmt('Bash', bashHooks);
+    fmt('PowerShell', psHooks);
+    shieldBar.tooltip = lines.join('\n');
+    shieldBar.show();
+  };
+  // Initial render — refreshed after the installer settles, and on a
+  // 30s tick alongside the version poll below.
+  renderShield();
+
   // State drives status bar text/icon/colour and the click-through advice.
   // - notRegistered: mcp.json missing entry → broken icon, advise registration.
   // - connecting: registered, within grace period for the bridge to auth →
@@ -67,15 +136,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // - registeredAwaitingClient: still no bridge after the grace period →
   //   warn icon, advise restarting Claude Code.
   // - ready: at least one authed client connected → terminal icon.
+  // - versionMismatch: a newer .vsix is installed than the running host.
+  //   Overrides all other states because reloading the window fixes it and
+  //   nothing else will work right until then.
   const CONNECT_GRACE_MS = 15_000;
-  let regState: 'notRegistered' | 'connecting' | 'registeredAwaitingClient' | 'ready' =
+  let regState: 'notRegistered' | 'connecting' | 'registeredAwaitingClient' | 'ready' | 'versionMismatch' =
     isRegisteredWithClaude(context) ? 'connecting' : 'notRegistered';
   let graceTimer: NodeJS.Timeout | null = null;
+  // Newest version we've observed on disk or reported by a client. Sticky:
+  // once we see a newer version we stay in the mismatch state until the host
+  // restarts (which is exactly the user action we want to prompt).
+  let observedNewerVersion: string | null = null;
   const renderStatus = () => {
     if (!statusBar) return;
     // Icon-only status bar to save space. States distinguished by icon
     // and background colour; details live in the tooltip and click-through.
-    if (regState === 'ready') {
+    if (regState === 'versionMismatch') {
+      statusBar.text = `$(error)`;
+      statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+      statusBar.tooltip =
+        `Terminal Reader v${version} — newer version v${observedNewerVersion ?? '?'} is installed.\n` +
+        `Reload the VSCode window (Ctrl+Shift+P → "Developer: Reload Window") so the new extension code activates.\n` +
+        `Pipe: ${pipePath}`;
+    } else if (regState === 'ready') {
       statusBar.text = `$(terminal)`;
       statusBar.backgroundColor = undefined;
       statusBar.tooltip =
@@ -140,10 +223,73 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         graceTimer = null;
       }
       pendingReloadPrompt = false;
-      regState = 'ready';
-      renderStatus();
+      // Don't downgrade out of versionMismatch on a client connect — the
+      // newer-version warning is the more important signal.
+      if (regState !== 'versionMismatch') {
+        regState = 'ready';
+        renderStatus();
+      }
     })
   );
+
+  // Trip the mismatch state once. Sticky for the lifetime of the host: the
+  // only way to recover is to reload the window, which is what we're prompting
+  // the user to do.
+  let mismatchPrompted = false;
+  const tripVersionMismatch = (newer: string) => {
+    if (compareVersions(newer, version) <= 0) return;
+    if (observedNewerVersion && compareVersions(newer, observedNewerVersion) <= 0) {
+      // Already at or above this version — no need to re-prompt.
+    } else {
+      observedNewerVersion = newer;
+    }
+    if (regState === 'versionMismatch') {
+      renderStatus();
+      return;
+    }
+    regState = 'versionMismatch';
+    if (graceTimer) {
+      clearTimeout(graceTimer);
+      graceTimer = null;
+    }
+    renderStatus();
+    if (!mismatchPrompted) {
+      mismatchPrompted = true;
+      void (async () => {
+        const choice = await vscode.window.showWarningMessage(
+          `Terminal Reader: a newer version (v${observedNewerVersion}) is installed.\n` +
+          `Reload the VSCode window so the new extension code activates.`,
+          'Reload window', 'Later'
+        );
+        if (choice === 'Reload window') {
+          await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        }
+      })();
+    }
+  };
+
+  context.subscriptions.push(server.onVersionMismatch((clientVersion) => tripVersionMismatch(clientVersion)));
+
+  // Poll the installed package.json. A newer .vsix gets dropped on disk by
+  // the VSCode installer but doesn't restart the extension host — the bridge
+  // path catches the case where Claude Code reconnects, but if the user just
+  // installs an update and walks away with no MCP traffic, this timer is what
+  // surfaces the warning.
+  const pkgPath = path.join(context.extensionPath, 'package.json');
+  const checkInstalledVersion = () => {
+    try {
+      const raw = fs.readFileSync(pkgPath, 'utf8');
+      const onDisk = JSON.parse(raw)?.version;
+      if (typeof onDisk === 'string' && compareVersions(onDisk, version) > 0) {
+        tripVersionMismatch(onDisk);
+      }
+    } catch {
+      // package.json transiently missing during install — ignore.
+    }
+  };
+  const versionPollTimer = setInterval(checkInstalledVersion, 30_000);
+  setImmediate(checkInstalledVersion);
+  context.subscriptions.push({ dispose: () => clearInterval(versionPollTimer) });
   context.subscriptions.push({
     dispose: () => {
       if (graceTimer) {
@@ -175,13 +321,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
 
+  // Vendor the two unhomed hook scripts and ensure settings.json carries
+  // their entries. Idempotent; runs off the activation path. Refresh the
+  // shield indicator once the install pass completes so a fresh install
+  // shows up immediately.
+  setImmediate(async () => {
+    try {
+      await installer.install();
+    } catch (e: any) {
+      // Best-effort — installer logs its own failures. Don't surface a UI.
+      process.stderr.write(`[vscode-tr] hook installer failed: ${e?.message ?? e}\n`);
+    }
+    renderShield();
+  });
+
+  // Refresh the shield periodically — picks up settings.json edits the user
+  // makes outside the extension (e.g. adding a new hook). Reuses the same
+  // 30 s cadence as the version poll.
+  const shieldPollTimer = setInterval(renderShield, 30_000);
+  context.subscriptions.push({ dispose: () => clearInterval(shieldPollTimer) });
+
   context.subscriptions.push(
     vscode.commands.registerCommand('vscodeTerminalReader.showStatus', async () => {
       const detail =
         `v${version}  •  Pipe: ${pipePath}  •  Workspace: ${wsRoot ?? '(none)'}  •  ` +
         `Extension host PID: ${extensionHostPid}  •  Window PID: ${info.windowPid}  •  ` +
         `Terminals: ${terminals.list().length}  •  Authed clients: ${server?.authedClientCount ?? 0}`;
-      if (regState === 'ready') {
+      if (regState === 'versionMismatch') {
+        const pick = await vscode.window.showWarningMessage(
+          `Terminal Reader: a newer version (v${observedNewerVersion ?? '?'}) is installed but the running host is v${version}.\n` +
+          `Reload the VSCode window so the new extension code activates.\n\n${detail}`,
+          'Reload window', 'Dismiss'
+        );
+        if (pick === 'Reload window') {
+          await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        }
+      } else if (regState === 'ready') {
         await vscode.window.showInformationMessage(
           `Terminal Reader: connected.\n${detail}`,
           'Got it'
@@ -221,7 +396,39 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       vscode.window.showInformationMessage('Terminal Reader: buffers cleared');
     }),
     vscode.commands.registerCommand('vscodeTerminalReader.register', () => registerWithClaude(context)),
-    vscode.commands.registerCommand('vscodeTerminalReader.unregister', () => unregisterFromClaude())
+    vscode.commands.registerCommand('vscodeTerminalReader.unregister', () => unregisterFromClaude()),
+    vscode.commands.registerCommand('vscodeTerminalReader.showHookStatus', async () => {
+      const bashHooks = hooks.listActiveHooks('bash');
+      const psHooks = hooks.listActiveHooks('powershell');
+      const bundled = installer.listBundled();
+      const all = [...bashHooks, ...psHooks];
+      if (all.length === 0) {
+        await vscode.window.showInformationMessage(
+          'Terminal Reader: no PreToolUse hooks configured in ~/.claude/settings.json.',
+          'Got it'
+        );
+        return;
+      }
+      const lines: string[] = [
+        `${all.length} PreToolUse hook${all.length === 1 ? '' : 's'} run before every terminal_run.`,
+        ''
+      ];
+      const fmt = (label: string, list: typeof bashHooks) => {
+        if (list.length === 0) return;
+        lines.push(`${label}:`);
+        for (const h of list) {
+          const owned = bundled.some((b) => h.resolvedPath && b.installedPath.toLowerCase() === h.resolvedPath.toLowerCase());
+          const tag = owned ? '(vendored by Terminal Reader)' : '';
+          const present = h.resolvedPath ? `✓ ${h.resolvedPath}` : '⚠ not found on disk';
+          lines.push(`  • [${h.matcher || '*'}] ${h.command} ${tag}`.trimEnd());
+          lines.push(`      ${present}  (timeout ${h.timeoutSeconds}s)`);
+        }
+        lines.push('');
+      };
+      fmt('Bash', bashHooks);
+      fmt('PowerShell', psHooks);
+      await vscode.window.showInformationMessage(lines.join('\n'), 'Got it');
+    })
   );
 
   context.subscriptions.push({
