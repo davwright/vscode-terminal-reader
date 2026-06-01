@@ -30,6 +30,20 @@ const APP_DIR = process.platform === 'win32'
   : path.join(os.homedir(), '.vscode-terminal-reader');
 const WINDOWS_DIR = path.join(APP_DIR, 'windows');
 
+// Bridge ships inside the .vsix; its own version is the on-disk extension
+// version. Sent during auth so the host can detect that the user installed a
+// newer .vsix but hasn't reloaded the window (the host is still running the
+// old code).
+function readBridgeVersion() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    return typeof pkg.version === 'string' ? pkg.version : null;
+  } catch (_) {
+    return null;
+  }
+}
+const BRIDGE_VERSION = readBridgeVersion();
+
 function listEndpoints() {
   if (!fs.existsSync(WINDOWS_DIR)) return [];
   const files = fs.readdirSync(WINDOWS_DIR).filter((f) => f.endsWith('.json'));
@@ -123,7 +137,64 @@ function writeMcp(msg) {
   process.stdout.write(JSON.stringify(msg) + '\n');
 }
 
-const SERVER_INFO = { name: 'vscode-reader', version: '0.0.1' };
+const SERVER_INFO = { name: 'vscode-reader', version: BRIDGE_VERSION || '0.0.0' };
+
+// Server-level guidance surfaced to the model on connect. The job here is to
+// flip the default instinct — "loop calling terminal_state with a sleep" —
+// into the event-driven pattern this server is built for: launch once, then
+// block on a real signal (shell-integration D-mark or a regex you choose).
+const SERVER_INSTRUCTIONS = [
+  '# vscode-reader — drive long-running terminal commands without polling',
+  '',
+  'This server is a control loop for the live terminals in the user\'s VSCode window. You can',
+  'start a command, then BLOCK efficiently until it finishes or until a line you care about',
+  'appears — no sleep loops, no repeated status checks. One tool call sleeps server-side and',
+  'wakes the instant the signal fires.',
+  '',
+  '## Do this — block on a signal, not a timer',
+  '',
+  'Run-and-wait in a single call:',
+  "  terminal_run({ command: 'npm run build', wait: true })",
+  '→ returns the moment shell integration reports the command ended, with its exitCode. The',
+  '  call sleeps the whole time; it costs you nothing until it wakes.',
+  '',
+  'Return early on a meaningful line (a dev server that never "ends", or a failure you want to',
+  'bail on before the full run completes) — returnOnPattern is a JS regex matched live against',
+  'each new (ANSI-stripped) output line:',
+  "  terminal_run({ command: 'npm run dev', wait: true, returnOnPattern: 'Listening on port \\\\d+' })",
+  "  terminal_run({ command: 'npm test',    wait: true, returnOnPattern: 'failed|Error:|✗' })",
+  '→ wakes on the first matching line OR command end OR timeout, whichever is first. Use it for',
+  '  readiness probes (server up) and for early bail-out (first error) alike.',
+  '',
+  'Wait on something you did NOT launch via this server — a command the user typed, or one you',
+  'started earlier without wait:true:',
+  "  terminal_wait({ returnOnPattern: 'Compiled successfully', timeoutMs: 120000 })",
+  '',
+  '## The pattern for jobs longer than the 5-minute wait cap',
+  '',
+  'A single wait is capped at 300000 ms (5 min). For a longer job, do NOT switch to a sleep',
+  'loop — re-arm the wait. terminal_wait blocks server-side again from where it left off:',
+  "  loop: terminal_wait({ returnOnPattern: 'BUILD SUCCESSFUL|BUILD FAILED', timeoutMs: 300000 })",
+  '        — reason:\'pattern\' → done. reason:\'timeout\' → call it again. reason:\'finished\' → it ended.',
+  'Each iteration is one blocking call that wakes on the real event; you are not burning turns',
+  'spinning. Only fall back to terminal_state polling when shell integration is OFF (no D-mark,',
+  'so reason:\'unsupported\' comes back immediately — see below).',
+  '',
+  '## Reading output efficiently',
+  '',
+  'terminal_run clears the line buffer and returns runId = the first line number of this run.',
+  'After a wait, fetch only this run\'s output: terminal_read({ range: [runId, totalLines] }).',
+  'grep server-side instead of pulling the whole buffer: terminal_read({ grep: \'error\', context: 3 }).',
+  'Line numbers are stable and monotonic across the buffer\'s life — grep to find line N, then',
+  're-read range:[N-3, N+3] for surrounding context.',
+  '',
+  '## When the blocking calls won\'t work',
+  '',
+  'Waiting needs shell integration (OSC 633 D-marks) to know when a command ends. If it is off,',
+  'terminal_run/terminal_wait return reason:\'unsupported\' immediately — that is the ONLY case',
+  'where you should poll terminal_state in a loop (use totalLines to fetch just new lines).',
+  'terminal_interrupt sends Ctrl-C to kill a runaway command; it is never gated by permissions.'
+].join('\n');
 
 function makeError(id, code, message) {
   return { jsonrpc: '2.0', id: id ?? null, error: { code, message } };
@@ -133,7 +204,7 @@ async function ensureConnected(state) {
   if (state.sock && !state.sock.destroyed) return state.sock;
   const ep = pickEndpoint();
   const sock = await connect(ep);
-  await sendRpc(sock, 'auth', { token: ep.token });
+  await sendRpc(sock, 'auth', { token: ep.token, clientVersion: BRIDGE_VERSION });
   state.sock = sock;
   state.endpoint = ep;
   log('connected to', ep.pipePath, 'workspace=', ep.workspaceRoot);
@@ -151,7 +222,8 @@ async function handleMcp(state, msg) {
           result: {
             protocolVersion: '2024-11-05',
             capabilities: { tools: {} },
-            serverInfo: SERVER_INFO
+            serverInfo: SERVER_INFO,
+            instructions: SERVER_INSTRUCTIONS
           }
         });
       case 'notifications/initialized':
