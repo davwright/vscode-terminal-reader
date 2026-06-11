@@ -14,6 +14,7 @@ export interface ReadOpts {
 }
 
 export interface JsonReadResult {
+  id: number;
   name: string;
   format: 'json';
   totalLines: number;
@@ -21,6 +22,7 @@ export interface JsonReadResult {
 }
 
 export interface TextReadResult {
+  id: number;
   name: string;
   format: 'text';
   totalLines: number;
@@ -28,6 +30,7 @@ export interface TextReadResult {
 }
 
 export interface RawReadResult {
+  id: number;
   name: string;
   format: 'raw';
   totalBytes: number;
@@ -37,6 +40,7 @@ export interface RawReadResult {
 export type ReadResult = JsonReadResult | TextReadResult | RawReadResult;
 
 export interface TerminalState {
+  id: number;
   name: string;
   status: 'busy' | 'idle' | 'unknown';
   shellIntegration: boolean;
@@ -50,6 +54,11 @@ export interface TerminalState {
 }
 
 interface TerminalEntry {
+  // Stable, monotonic id assigned when the terminal is first tracked. Unlike
+  // `name` (which the shell/user can change) and the list index (which shifts as
+  // terminals open/close), this never changes for the life of the terminal — so
+  // a caller that captured an id can always re-target the exact same terminal.
+  id: number;
   terminal: vscode.Terminal;
   buffer: RingBuffer;
   rawBuffer: string;
@@ -72,6 +81,7 @@ const RAW_BUFFER_MAX_BYTES = 1024 * 1024; // 1 MiB rolling raw stream per termin
 export class TerminalCapture implements vscode.Disposable {
   private readonly entries = new Map<vscode.Terminal, TerminalEntry>();
   private readonly disposables: vscode.Disposable[] = [];
+  private nextId = 1;
 
   constructor(private readonly maxLines: () => number) {
     for (const t of vscode.window.terminals) this.track(t);
@@ -126,6 +136,7 @@ export class TerminalCapture implements vscode.Disposable {
   private track(terminal: vscode.Terminal): void {
     if (this.entries.has(terminal)) return;
     this.entries.set(terminal, {
+      id: this.nextId++,
       terminal,
       buffer: new RingBuffer(this.maxLines()),
       rawBuffer: '',
@@ -150,8 +161,12 @@ export class TerminalCapture implements vscode.Disposable {
     }
   }
 
-  private resolve(target: { name?: string; index?: number }): TerminalEntry | undefined {
+  private resolve(target: { id?: number; name?: string; index?: number }): TerminalEntry | undefined {
     const list = Array.from(this.entries.values());
+    // id wins — it's the only target that can't be aliased by a rename or shifted
+    // by another terminal opening/closing. Name is next (human-friendly but can
+    // collide or change), then index (positional, least stable).
+    if (typeof target.id === 'number') return list.find((e) => e.id === target.id);
     if (target.name) return list.find((e) => e.terminal.name === target.name);
     if (typeof target.index === 'number') return list[target.index];
     // Default: most recently active. The active terminal is the user's focus
@@ -165,6 +180,7 @@ export class TerminalCapture implements vscode.Disposable {
   }
 
   list(): Array<{
+    id: number;
     name: string;
     cwd: string | undefined;
     shellIntegration: boolean;
@@ -174,6 +190,7 @@ export class TerminalCapture implements vscode.Disposable {
     lastExitCode?: number;
   }> {
     return Array.from(this.entries.values()).map((e) => ({
+      id: e.id,
       name: e.terminal.name,
       cwd: e.terminal.shellIntegration?.cwd?.fsPath,
       shellIntegration: e.shellIntegrationActive,
@@ -185,7 +202,7 @@ export class TerminalCapture implements vscode.Disposable {
   }
 
   read(
-    target: { name?: string; index?: number },
+    target: { id?: number; name?: string; index?: number },
     opts: ReadOpts = {}
   ): ReadResult | { error: string } {
     const entry = this.resolve(target);
@@ -197,10 +214,11 @@ export class TerminalCapture implements vscode.Disposable {
     return Array.from(this.entries.values()).map((entry) => this.formatRead(entry, opts));
   }
 
-  state(target: { name?: string; index?: number } = {}): TerminalState | { error: string } {
+  state(target: { id?: number; name?: string; index?: number } = {}): TerminalState | { error: string } {
     const entry = this.resolve(target);
     if (!entry) return { error: 'terminal not found' };
     return {
+      id: entry.id,
       name: entry.terminal.name,
       status: entry.shellIntegrationActive ? (entry.busy ? 'busy' : 'idle') : 'unknown',
       shellIntegration: entry.shellIntegrationActive,
@@ -219,7 +237,7 @@ export class TerminalCapture implements vscode.Disposable {
    * Ctrl-C is a safety primitive, the user always wants the LLM to be able
    * to abort a runaway command.
    */
-  interrupt(target: { name?: string; index?: number } = {}): { sent: boolean; name?: string; reason?: string } {
+  interrupt(target: { id?: number; name?: string; index?: number } = {}): { sent: boolean; name?: string; reason?: string } {
     const entry = this.resolve(target);
     if (!entry) return { sent: false, reason: 'terminal not found' };
     try {
@@ -235,7 +253,7 @@ export class TerminalCapture implements vscode.Disposable {
    * has reported one. Returns undefined when integration is off or hasn't yet
    * fired a CWD update.
    */
-  cwdOf(target: { name?: string; index?: number } = {}): string | undefined {
+  cwdOf(target: { id?: number; name?: string; index?: number } = {}): string | undefined {
     const entry = this.resolve(target);
     return entry?.terminal.shellIntegration?.cwd?.fsPath;
   }
@@ -245,7 +263,7 @@ export class TerminalCapture implements vscode.Disposable {
    * when available, falling back to the platform default. Returns 'bash'
    * if detection fails — see Permissions for the namespace mapping.
    */
-  detectShell(target: { name?: string; index?: number } = {}): 'powershell' | 'bash' | null {
+  detectShell(target: { id?: number; name?: string; index?: number } = {}): 'powershell' | 'bash' | null {
     const entry = this.resolve(target);
     if (!entry) return null;
     const opts = entry.terminal.creationOptions as { shellPath?: string } | undefined;
@@ -267,7 +285,7 @@ export class TerminalCapture implements vscode.Disposable {
    * responsibility — this method does no permission checking and no clearing.
    */
   run(
-    target: { name?: string; index?: number },
+    target: { id?: number; name?: string; index?: number },
     command: string,
     addNewline: boolean
   ): { sent: boolean; name?: string; runId?: number; reason?: string } {
@@ -294,7 +312,7 @@ export class TerminalCapture implements vscode.Disposable {
    * because OSC 633 D-marks are the only reliable end-of-command signal.
    */
   async waitForIdle(
-    target: { name?: string; index?: number },
+    target: { id?: number; name?: string; index?: number },
     opts: {
       timeoutMs: number;
       returnOnPattern?: string;
@@ -470,6 +488,7 @@ export class TerminalCapture implements vscode.Disposable {
         lines = lines.slice(-opts.tail);
       }
       return {
+        id: entry.id,
         name: entry.terminal.name,
         format: 'raw',
         totalBytes: entry.rawBytes,
@@ -490,7 +509,7 @@ export class TerminalCapture implements vscode.Disposable {
         : matches;
 
     if (format === 'json') {
-      return { name: entry.terminal.name, format: 'json', totalLines, lines };
+      return { id: entry.id, name: entry.terminal.name, format: 'json', totalLines, lines };
     }
 
     // 'text' format: pipe-separated, padded line numbers. Padding width tracks
@@ -499,10 +518,10 @@ export class TerminalCapture implements vscode.Disposable {
     const maxNum = lines.length > 0 ? lines[lines.length - 1].lineNumber : 1;
     const width = Math.max(4, String(maxNum).length);
     const text = lines.map((l) => `${String(l.lineNumber).padStart(width)} | ${l.text}`).join('\n');
-    return { name: entry.terminal.name, format: 'text', totalLines, text };
+    return { id: entry.id, name: entry.terminal.name, format: 'text', totalLines, text };
   }
 
-  clear(target?: { name?: string; index?: number; all?: boolean }): { cleared: string[] } {
+  clear(target?: { id?: number; name?: string; index?: number; all?: boolean }): { cleared: string[] } {
     if (!target || target.all) {
       const names: string[] = [];
       for (const e of this.entries.values()) {

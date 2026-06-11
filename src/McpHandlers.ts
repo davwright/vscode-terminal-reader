@@ -36,16 +36,17 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'terminal_list',
     description:
-      "List terminals in this VSCode window with state. Each entry: {name, cwd, shellIntegration, bufferLines, busy, lastCommand?, lastExitCode?}. busy=true if a command is currently running.",
+      "List terminals in this VSCode window with state. Each entry: {id, name, cwd, shellIntegration, bufferLines, busy, lastCommand?, lastExitCode?}. busy=true if a command is currently running. `id` is a stable per-terminal handle — pass it back as the `id` target on read/state/interrupt/run/wait to hit exactly this terminal regardless of later renames or index shifts (name can change or collide; index moves as terminals open/close).",
     inputSchema: { type: 'object', properties: {}, additionalProperties: false }
   },
   {
     name: 'terminal_read',
     description:
-      `Read terminal output. Identify with name or index (default: most recently active). ${SELECTION_DOC} ${FORMAT_DOC} Line numbers are stable, monotonic, 1-based across reads — grep first, then re-read with range:[N-3,N+3] for context.`,
+      `Read terminal output. Identify with id (stable, preferred), name, or index (default: most recently active). ${SELECTION_DOC} ${FORMAT_DOC} Line numbers are stable, monotonic, 1-based across reads — grep first, then re-read with range:[N-3,N+3] for context.`,
     inputSchema: {
       type: 'object',
       properties: {
+        id: { type: 'number', description: 'Stable terminal id from terminal_list. Preferred target — unaffected by renames or index shifts.' },
         name: { type: 'string' },
         index: { type: 'number' },
         tail: { type: 'number' },
@@ -81,6 +82,7 @@ export const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        id: { type: 'number', description: 'Stable terminal id from terminal_list. Preferred target — unaffected by renames or index shifts.' },
         name: { type: 'string' },
         index: { type: 'number' }
       },
@@ -94,6 +96,7 @@ export const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        id: { type: 'number', description: 'Stable terminal id from terminal_list. Preferred target — unaffected by renames or index shifts.' },
         name: { type: 'string' },
         index: { type: 'number' }
       },
@@ -107,6 +110,7 @@ export const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        id: { type: 'number', description: 'Stable terminal id from terminal_list. Preferred target — unaffected by renames or index shifts.' },
         name: { type: 'string' },
         index: { type: 'number' },
         all: { type: 'boolean' }
@@ -141,6 +145,7 @@ export const TOOLS: ToolDef[] = [
       type: 'object',
       properties: {
         command: { type: 'string' },
+        id: { type: 'number', description: 'Stable terminal id from terminal_list. Preferred target — unaffected by renames or index shifts.' },
         name: { type: 'string' },
         index: { type: 'number' },
         addNewline: { type: 'boolean', description: 'Append newline so the command executes immediately. Default true.' },
@@ -189,6 +194,7 @@ export const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        id: { type: 'number', description: 'Stable terminal id from terminal_list. Preferred target — unaffected by renames or index shifts.' },
         name: { type: 'string' },
         index: { type: 'number' },
         timeoutMs: { type: 'number', description: 'Default 60000, clamped to [0, 300000].' },
@@ -369,7 +375,7 @@ export function makeDispatcher(opts: {
         return terminals.list();
       case 'terminal_read':
         return terminals.read(
-          { name: args.name, index: args.index },
+          { id: args.id, name: args.name, index: args.index },
           {
             tail: args.tail,
             grep: args.grep,
@@ -391,15 +397,15 @@ export function makeDispatcher(opts: {
           stripAnsi: stripAnsi()
         });
       case 'terminal_state':
-        return terminals.state({ name: args.name, index: args.index });
+        return terminals.state({ id: args.id, name: args.name, index: args.index });
       case 'terminal_interrupt':
-        return terminals.interrupt({ name: args.name, index: args.index });
+        return terminals.interrupt({ id: args.id, name: args.name, index: args.index });
       case 'terminal_clear':
-        return terminals.clear({ name: args.name, index: args.index, all: args.all });
+        return terminals.clear({ id: args.id, name: args.name, index: args.index, all: args.all });
       case 'terminal_run': {
         const command = String(args.command ?? '');
         if (!command) return { accepted: false, reason: 'command is required' };
-        const target = { name: args.name, index: args.index };
+        const target = { id: args.id, name: args.name, index: args.index };
         const shell = terminals.detectShell(target);
         if (!shell) return { accepted: false, reason: 'terminal not found' };
         // Replay the user's Claude Code PreToolUse hooks against this command
@@ -438,7 +444,7 @@ export function makeDispatcher(opts: {
         return { ...base, finished: isFinishedReason(waitRes.reason), ...waitRes };
       }
       case 'terminal_wait': {
-        const target = { name: args.name, index: args.index };
+        const target = { id: args.id, name: args.name, index: args.index };
         const waitRes = await terminals.waitForIdle(target, {
           timeoutMs: clampWaitTimeout(args.timeoutMs),
           returnOnPattern: args.returnOnPattern,
