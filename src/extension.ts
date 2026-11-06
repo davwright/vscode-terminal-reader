@@ -9,7 +9,6 @@ import { IpcServer, compareVersions } from './IpcServer';
 import { makeDispatcher } from './McpHandlers';
 import { Permissions } from './Permissions';
 import { HookRunner } from './HookRunner';
-import { HookInstaller } from './HookInstaller';
 import { BrowserController } from './browser/BrowserController';
 import {
   buildPipeName,
@@ -43,10 +42,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // HookRunner replays the user's ~/.claude/settings.json PreToolUse hooks
   // against each terminal_run, closing the side-door past hooks that match
-  // on "Bash" / "PowerShell". HookInstaller keeps the two vendored scripts
-  // (block-git-write, block-python) on disk and registered.
+  // on "Bash" / "PowerShell".
   const hooks = new HookRunner();
-  const installer = new HookInstaller(context.extensionPath);
 
   const dispatch = makeDispatcher({
     terminals,
@@ -124,8 +121,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     shieldBar.tooltip = lines.join('\n');
     shieldBar.show();
   };
-  // Initial render — refreshed after the installer settles, and on a
-  // 30s tick alongside the version poll below.
+  // Initial render, then refreshed on a 30s tick alongside the version poll below.
   renderShield();
 
   // State drives status bar text/icon/colour and the click-through advice.
@@ -321,20 +317,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
 
-  // Vendor the two unhomed hook scripts and ensure settings.json carries
-  // their entries. Idempotent; runs off the activation path. Refresh the
-  // shield indicator once the install pass completes so a fresh install
-  // shows up immediately.
-  setImmediate(async () => {
-    try {
-      await installer.install();
-    } catch (e: any) {
-      // Best-effort — installer logs its own failures. Don't surface a UI.
-      process.stderr.write(`[vscode-tr] hook installer failed: ${e?.message ?? e}\n`);
-    }
-    renderShield();
-  });
-
   // Refresh the shield periodically — picks up settings.json edits the user
   // makes outside the extension (e.g. adding a new hook). Reuses the same
   // 30 s cadence as the version poll.
@@ -400,7 +382,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('vscodeTerminalReader.showHookStatus', async () => {
       const bashHooks = hooks.listActiveHooks('bash');
       const psHooks = hooks.listActiveHooks('powershell');
-      const bundled = installer.listBundled();
       const all = [...bashHooks, ...psHooks];
       if (all.length === 0) {
         await vscode.window.showInformationMessage(
@@ -417,10 +398,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (list.length === 0) return;
         lines.push(`${label}:`);
         for (const h of list) {
-          const owned = bundled.some((b) => h.resolvedPath && b.installedPath.toLowerCase() === h.resolvedPath.toLowerCase());
-          const tag = owned ? '(vendored by Terminal Reader)' : '';
           const present = h.resolvedPath ? `✓ ${h.resolvedPath}` : '⚠ not found on disk';
-          lines.push(`  • [${h.matcher || '*'}] ${h.command} ${tag}`.trimEnd());
+          lines.push(`  • [${h.matcher || '*'}] ${h.command}`);
           lines.push(`      ${present}  (timeout ${h.timeoutSeconds}s)`);
         }
         lines.push('');

@@ -48,7 +48,7 @@ If a future change adds any of these, drop the corresponding entry from this lis
 
 ## PreToolUse hook replay — terminal_run is not a side door
 
-`terminal_run` runs **the user's `~/.claude/settings.json` `PreToolUse` hooks first**, before the workspace allow/deny check from `Permissions.ts`. Without this, Claude could escape `block-git-write.sh` / `block-python.sh` / similar by routing commands through `mcp__vscode-reader__terminal_run` (which doesn't match the user's `"Bash"` / `"PowerShell"` matchers). Ordering: hook block > permission deny > permission allow.
+`terminal_run` runs **the user's `~/.claude/settings.json` `PreToolUse` hooks first**, before the workspace allow/deny check from `Permissions.ts`. Without this, Claude could escape the git/python guards by routing commands through `mcp__vscode-reader__terminal_run` (which doesn't match the user's `"Bash"` / `"PowerShell"` matchers). Ordering: hook block > permission deny > permission allow.
 
 Implementation lives in [src/HookRunner.ts](src/HookRunner.ts). The runner:
 
@@ -64,21 +64,11 @@ Deferred (mirrored in the comment block at the top of `HookRunner.ts` — keep b
 - Exec-form `command` hooks (`args` present)
 - `fs.watch` hot reload — re-read on every call
 
-## Vendored hooks — installed and kept hot
+## Hooks
 
-The two scripts under [hooks/](hooks/) (`block-git-write.sh`, `block-python.sh`) are vendored from the user's `~/.claude/hooks/`. [src/HookInstaller.ts](src/HookInstaller.ts) installs them into `~/.claude/hooks/` and ensures `~/.claude/settings.json` has matching `PreToolUse` `"Bash"` entries on every activation.
+This extension installs no hooks. The guards (git writes, python, ev) live in `claude-git-guard.exe` from c:/git/tools/githooks.
 
-Versioning is a single integer in a comment line near the top of each script:
-
-```bash
-# vscode-terminal-reader-hook: name=block-git-write version=1
-```
-
-Install rule: copy bundled → installed only when `bundledVersion > installedVersion` (treat absent file / missing header as version 0). We never downgrade. Settings.json entries are added when missing; on a version bump the installer also normalises `type` / `command` / `timeout` to the canonical shape but leaves matching entries alone when versions are equal.
-
-`block-ev-customer-writes.sh` lives in the `EvolxCli` repo and is **not** vendored or touched here — that repo owns it.
-
-The status bar shows a separate `$(shield)` icon (gold/yellow) whenever any `PreToolUse` hooks are armed for `Bash` or `PowerShell`. Click → "Show active PreToolUse hooks" command lists them. Refreshed every 30s and after the installer runs.
+The status bar shows a separate `$(shield)` icon (gold/yellow) whenever any `PreToolUse` hooks are armed for `Bash` or `PowerShell`. Click → "Show active PreToolUse hooks" command lists them. Refreshed every 30s.
 
 ## Embedded browser surface — what's implemented vs deferred
 
